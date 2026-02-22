@@ -23,6 +23,8 @@ using std::filesystem::path;
 
 path prog;
 
+constexpr const char *kRunRoot = "/run/jai";
+
 // Self-closing, movable file descriptor, use operator* to access value
 struct Fd {
   int fd_{-1};
@@ -83,21 +85,20 @@ struct Config {
   uid_t uid_ = -1;
   gid_t gid_ = -1;
   path homepath_;
+
   Fd homefd_;
-  Fd jaifd_;
+  Fd home_jai_fd_;
+  Fd run_jai_fd_;
 
   void init();
   Fd makemount();
   Fd makens();
 
+  Fd make_overlay();
+
   [[nodiscard]] Defer asuser();
-  Fd mkudir(int dirfd, path p, mode_t mode = 0755);
-  int jaifd()
-  {
-    if (!jaifd_)
-      jaifd_ = mkudir(*homefd_, ".jai");
-    return *jaifd_;
-  }
+  int homejai();
+  int runjai();
 };
 
 template<typename... Args>
@@ -179,15 +180,23 @@ openlock(int dfd, path file)
   return fd;
 }
 
+enum class FollowLinks {
+  kNoFollow = 0,
+  kFollow = 1,
+};
+using enum FollowLinks;
+
 Fd
-ensure_dir(int dfd, path p, mode_t perm = 0755, bool follow = true)
+ensure_dir(int dfd, path p, mode_t perm, FollowLinks follow)
 {
+  assert(!p.empty());
+
   Fd fd;
-  int flag = follow ? 0 : O_NOFOLLOW;
+  int flag = follow == kFollow ? 0 : O_NOFOLLOW;
   for (auto component = p.begin(); component != p.end();) {
-    if ((fd = openat(dfd, component->c_str(),
-                     O_PATH | O_DIRECTORY | O_CLOEXEC | flag))) {
-      dfd = *fd;
+    if (Fd nfd = openat(dfd, component->c_str(),
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC | flag)) {
+      dfd = *(fd = std::move(nfd));
       ++component;
     }
     else if (errno != ENOENT)
@@ -198,24 +207,15 @@ ensure_dir(int dfd, path p, mode_t perm = 0755, bool follow = true)
              component->string());
     // Don't advance iterator; want to open directory we just created
   }
+
+  struct stat sb;
+  if (fstat(*fd, &sb))
+    syserr(R"(fstat("{}"))", p.string());
+  if (auto euid = geteuid(); sb.st_uid != euid)
+    err("{}: has uid {} should have {}", p.string(), sb.st_uid, euid);
+  if (auto m = sb.st_mode & perm; m != (sb.st_mode & 07777) && fchmod(*fd, m))
+    syserr(R"(fchmod("{}", {:o}))", p.string(), m);
   return fd;
-}
-
-template<std::integral I>
-I
-parsei(const char *s)
-{
-  const char *const e = s + strlen(s);
-  I ret{};
-
-  auto [p, ec] = std::from_chars(s, e, ret, 10);
-
-  if (ec == std::errc::invalid_argument || p != e)
-    err<std::invalid_argument>("{}: not an integer", s);
-  if (ec == std::errc::result_out_of_range)
-    err<std::out_of_range>("{}: overflow", s);
-
-  return ret;
 }
 
 bool
@@ -361,12 +361,12 @@ Config::makens()
     syserr(R"(open_tree("{}"))", child_mnt.string());
 
   auto restore = asuser();
-  Fd target = openat(jaifd(), ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
+  Fd target = openat(homejai(), ".", O_TMPFILE | O_RDWR | O_CLOEXEC, 0600);
   if (!target)
     syserr("openat TMPFILE");
   if (flock(*target, LOCK_EX | LOCK_NB))
     syserr("flock TMPFILE");
-  if (linkat(*target, "", jaifd(), "mnt", AT_EMPTY_PATH)) {
+  if (linkat(*target, "", homejai(), "mnt", AT_EMPTY_PATH)) {
     if (errno == EEXIST)
       return {};
     syserr(R"(linkat(TMPFILE, "{}/.jai/mnt"))", homepath_.string());
@@ -374,7 +374,7 @@ Config::makens()
   restore.reset();
 
   // This won't work unless jaifd()/mnt is on an MS_PRIVATE mount
-  if (move_mount(AT_FDCWD, child_mnt.c_str(), jaifd(), "mnt", 0)) {
+  if (move_mount(AT_FDCWD, child_mnt.c_str(), homejai(), "mnt", 0)) {
     saved_errno = errno;
     auto x = std::format("id; ls -al {}", child_mnt.string());
     system(x.c_str());
@@ -397,67 +397,183 @@ Config::asuser()
   return Defer{[] { seteuid(0); }};
 }
 
+int
+Config::homejai()
+{
+  if (!home_jai_fd_) {
+    auto restore = asuser();
+    home_jai_fd_ = ensure_dir(*homefd_, ".jai", 0700, kFollow);
+  }
+  return *home_jai_fd_;
+}
+
+int
+Config::runjai()
+{
+  using namespace std::string_literals;
+  if (!run_jai_fd_) {
+    Fd parent;
+    for (;;) {
+      if ((parent = open(kRunRoot, O_RDONLY | O_DIRECTORY | O_CLOEXEC)))
+        break;
+      if (errno != ENOENT)
+        syserr("{}", kRunRoot);
+      path lockpath = kRunRoot + ".lock"s;
+
+      // We need to do 3 things atomically:
+      //   - mkdir kRunRoot
+      //   - make kRunRoot a mount point by bind-mounting it on itself
+      //   - make kRunRoot MS_PRIVATE
+      // Do them in a subprocess with real uid 0 to make it harder for
+      // a non-root user to interrupt if this program is setuid root.
+      int pid = fork();
+      if (pid == -1)
+        syserr("fork");
+      if (!pid) {
+        try {
+          if (setuid(0))
+            syserr("setuid(0)");
+          setgid(0);
+          if (setsid() == -1)
+            syserr("setsid");
+          auto lock = openlock(-1, lockpath);
+          if (!lock)
+            _exit(2);
+          parent = ensure_dir(-1, kRunRoot, 0755, kFollow);
+          if (mount(kRunRoot, kRunRoot, nullptr, MS_BIND, nullptr)) {
+            int saved_errno = errno;
+            rmdir(kRunRoot);
+            errno = saved_errno;
+            syserr("mount(MS_BIND)");
+          }
+          if (mount(nullptr, kRunRoot, nullptr, MS_PRIVATE, nullptr)) {
+            int saved_errno = errno;
+            umount(kRunRoot);
+            rmdir(kRunRoot);
+            errno = saved_errno;
+            syserr("mount(MS_PRIVATE)");
+          }
+          unlink(lockpath.c_str());
+          _exit(0);
+        } catch (std::exception &e) {
+          std::println(stderr, "{}", e.what());
+          fflush(stderr);
+          _exit(1);
+        }
+      }
+      int status;
+      if (waitpid(pid, &status, 0) != pid)
+        syserr("waitpid");
+      if (WIFEXITED(status)) {
+        if (WEXITSTATUS(status) == 0)
+          break;
+        if (WEXITSTATUS(status) == 2)
+          continue;
+      }
+      err("failed to create {}", kRunRoot);
+    }
+    run_jai_fd_ = ensure_dir(*parent, user_, 0755, kFollow);
+  }
+  return *run_jai_fd_;
+}
+
+std::vector default_blacklist = {
+    ".jai",
+    ".ssh",
+    ".gnupg",
+    ".local/share/keyrings",
+    ".netrc",
+    ".git-credentials",
+    ".aws",
+    ".azure",
+    ".config/gcloud",
+    ".config/gh",
+    ".config/Keybase",
+    ".config/kube",
+    ".docker",
+    ".password-store",
+    ".mozilla",
+    ".config/chromium",
+    ".config/google-chrome",
+    ".config/BraveSoftware",
+    ".bash_history",
+    ".zsh_history",
+};
+
 Fd
-Config::mkudir(int dirfd, path p, mode_t mode)
+make_blacklist(int dfd, path name)
+{
+  Fd blacklistfd = ensure_dir(dfd, name.c_str(), 0700, kFollow);
+  if (!dir_empty(*blacklistfd))
+    return blacklistfd;
+
+  for (path p : default_blacklist) {
+    try {
+      auto d = p.relative_path().parent_path();
+      if (!d.empty())
+        ensure_dir(*blacklistfd, d, 0700, kNoFollow);
+      if (Fd fd = openat(*blacklistfd, p.c_str(),
+                         O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+          !fd)
+        syserr("{}/{}", name.string(), p.string());
+    } catch (const std::exception &e) {
+      std::println(stderr, "{}", e.what());
+    }
+  }
+
+  return blacklistfd;
+}
+
+Fd
+overlay_mount(int lowerfd, int upperfd, int workfd, int attrs)
+{
+  Fd fsfd = fsopen("overlay", FSOPEN_CLOEXEC);
+  if (!fsfd)
+    syserr(R"(fsopen("overlay"))");
+
+  if (fsconfig(*fsfd, FSCONFIG_SET_FD, "lowerdir+", nullptr, lowerfd) ||
+      fsconfig(*fsfd, FSCONFIG_SET_FD, "upperdir", nullptr, upperfd) ||
+      fsconfig(*fsfd, FSCONFIG_SET_FD, "workdir", nullptr, workfd))
+    syserr("fsconfig(FSCONFIG_SET_FD)");
+  if (fsconfig(*fsfd, FSCONFIG_CMD_CREATE, nullptr, nullptr, 0))
+    syserr("fsconfig(FSCONFIG_CMD_CREATE)");
+
+  Fd mfd = fsmount(*fsfd, FSMOUNT_CLOEXEC, attrs);
+  if (!mfd)
+    syserr("fsmount");
+  return mfd;
+}
+
+Fd
+Config::make_overlay()
 {
   auto restore = asuser();
-  auto check = [this, &p](const struct stat &sb) {
-    if (!S_ISDIR(sb.st_mode))
-      err("{}: expected a directory", p.string());
-    if (sb.st_uid != uid_)
-      err("{}: expected a directory owned by {}", p.string(), user_);
-    if ((sb.st_mode & 0700) != 0700)
-      err("{}: expected a directory with owner rwx permissions", p.string());
-  };
-  struct stat sb;
+  Fd changes = make_blacklist(homejai(), "changes");
+  Fd work = ensure_dir(homejai(), "work", 0700, kFollow);
+  restore.reset();
 
-  // Okay to follow symlink to existing directory owned by user
-  if (Fd e{openat(dirfd, p.c_str(), O_RDONLY | O_CLOEXEC)}) {
-    if (fstat(*e, &sb))
-      syserr("fstat({})", p.string());
-    check(sb);
-    return e;
-  }
-  if (errno != ENOENT)
-    syserr("open({})", p.string());
+  Fd mnt = overlay_mount(*homefd_, *changes, *work,
+                         MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV);
 
-  if (mkdirat(dirfd, p.c_str(), mode))
-    syserr("mkdir({})", p.string());
-  Defer cleanup([dirfd, &p] { unlinkat(dirfd, p.c_str(), AT_REMOVEDIR); });
+  Fd olhome = ensure_dir(runjai(), "home", 0755, kFollow);
+  if (move_mount(*mnt, "", *olhome, "",
+                 MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_EMPTY_PATH))
+    syserr("move_mount");
 
-  Fd d{openat(dirfd, p.c_str(),
-              O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW)};
-  if (!d)
-    syserr("open({})", p.string());
-
-  // To void TOCTTOU bugs, make sure newly created directory is empty
-  // and owned by user.
-  if (!dir_empty(*d))
-    err("mkudir: newly created directory {} not empty", p.string());
-  if (fstat(*d, &sb))
-    syserr("fstat({})", p.string());
-  check(sb);
-
-  cleanup.release();
-  return d;
+  olhome = openat(runjai(), "home", O_RDONLY | O_CLOEXEC | O_DIRECTORY);
+  if (!olhome)
+    syserr("{}/{}/home", kRunRoot, user_);
+  return olhome;
 }
 
 int
 main(int argc, char **argv)
 {
+  umask(022);
   if (argc > 0)
     prog = argv[0];
 
-  path p{};
-  std::println("parent {}, filename {}\n", p.parent_path().string(),
-               p.filename().string());
-  p = "x";
-  std::println("parent {}, filename {}\n", p.parent_path().string(),
-               p.filename().string());
-
-  /*
   Config conf;
   conf.init();
-  conf.makens();
-  */
+  conf.make_overlay();
 }
