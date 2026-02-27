@@ -8,19 +8,16 @@
 #include <format>
 #include <functional>
 #include <ranges>
+#include <set>
 #include <string>
 #include <system_error>
 #include <type_traits>
 #include <utility>
 
-#include <set>
-
 #include <fcntl.h>
 #include <sys/acl.h>
 #include <sys/mount.h>
 #include <unistd.h>
-
-template<typename T> concept has_no_cv = std::same_as<T, std::remove_cv_t<T>>;
 
 // Format error message and throw an exception that captures errno
 template<typename... Args>
@@ -86,7 +83,7 @@ struct RaiiHelper {
   {
     return t_;
   }
-  decltype(auto) operator->(this auto &&self) noexcept { return self.t_; }
+  decltype(auto) operator->(this auto &&self) noexcept { return (self.t_); }
 
   T release() noexcept { return std::exchange(t_, Empty); }
 
@@ -162,6 +159,21 @@ void xmnt_move(int mountfd, int mountpointfd, path mountpointfile = {});
 void xmnt_setattr(int fd, const mount_attr &a,
                   unsigned int flags = AT_RECURSIVE);
 void xmnt_propagate(int fd, std::uint64_t propagation, bool recursive = true);
+
+template<std::convertible_to<const char *>... Opt>
+requires (sizeof...(Opt) % 2 == 0)
+Fd
+make_tmpfs(Opt... opt)
+{
+  Fd conf = fsopen("tmpfs", FSOPEN_CLOEXEC);
+  if (!conf)
+    syserr(R"(fsopen("tmpfs"))");
+  auto options = std::to_array<const char *>({opt...});
+  for (auto i = 0uz; i < options.size() - 1; i+= 2)
+    if (fsconfig(*conf, FSCONFIG_SET_STRING, options[i], options[i + 1], 0))
+      syserr(R"(fsconfig(tmpfs, "{}", "{}"))", options[i], options[i + 1]);
+  return make_mount(*conf);
+}
 
 void recursive_umount(path tree);
 

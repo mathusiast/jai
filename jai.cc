@@ -37,7 +37,7 @@ struct Config {
   Fd makemount();
   Fd makens();
 
-  Fd make_overlay();
+  Fd make_home_overlay();
 
   [[nodiscard]] Defer asuser();
   int homejai();
@@ -233,13 +233,7 @@ Config::runjai()
   // Get rid of any partially set up directories
   recursive_umount(kRunRoot);
 
-  Fd jaiconf = fsopen("tmpfs", FSOPEN_CLOEXEC);
-  if (!jaiconf)
-    syserr(R"(fsopen("tmpfs"))");
-  if (fsconfig(*jaiconf, FSCONFIG_SET_STRING, "size", "64M", 0) ||
-      fsconfig(*jaiconf, FSCONFIG_SET_STRING, "mode", "0755", 0))
-    syserr(R"(fsconfig(tmpfs))");
-  Fd mfd = make_mount(*jaiconf);
+  Fd mfd = make_tmpfs("size", "64M", "mode", "0755", "gid", "0");
   xmnt_move(*mfd, *ensure_dir(-1, kRunRoot, 0755, kFollow));
 
   run_jai_fd_ = ensure_dir(-1, kRunRoot, 0755, kFollow);
@@ -301,10 +295,11 @@ make_blacklist(int dfd, path name)
 
   for (path p : default_blacklist) {
     try {
-      auto d = p.relative_path().parent_path();
-      if (!d.empty())
-        ensure_dir(*blacklistfd, d, 0700, kNoFollow);
-      xopenat(*blacklistfd, p.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+      auto subdir = p.relative_path().parent_path();
+      xopenat(subdir.empty()
+                  ? *blacklistfd
+                  : *ensure_dir(*blacklistfd, subdir, 0700, kNoFollow),
+              p.filename(), O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
     } catch (const std::exception &e) {
       std::println(stderr, "{}", e.what());
     }
@@ -314,31 +309,25 @@ make_blacklist(int dfd, path name)
 }
 
 Fd
-overlay_mount(int lowerfd, int upperfd, int workfd)
-{
-  Fd fsfd = fsopen("overlay", FSOPEN_CLOEXEC);
-  if (!fsfd)
-    syserr(R"(fsopen("overlay"))");
-
-  if (fsconfig(*fsfd, FSCONFIG_SET_FD, "lowerdir+", nullptr, lowerfd) ||
-      fsconfig(*fsfd, FSCONFIG_SET_FD, "upperdir", nullptr, upperfd) ||
-      fsconfig(*fsfd, FSCONFIG_SET_FD, "workdir", nullptr, workfd))
-    syserr("fsconfig(FSCONFIG_SET_FD)");
-
-  return make_mount(*fsfd);
-}
-
-Fd
-Config::make_overlay()
+Config::make_home_overlay()
 {
   auto restore = asuser();
   Fd changes = make_blacklist(homejai(), "changes");
   Fd work = ensure_dir(homejai(), "work", 0700, kFollow);
   restore.reset();
 
-  Fd mnt = overlay_mount(*homefd_, *changes, *work);
+  Fd fsfd = fsopen("overlay", FSOPEN_CLOEXEC);
+  if (!fsfd)
+    syserr(R"(fsopen("overlay"))");
+  if (fsconfig(*fsfd, FSCONFIG_SET_FD, "lowerdir+", nullptr, *homefd_) ||
+      fsconfig(*fsfd, FSCONFIG_SET_FD, "upperdir", nullptr, *changes) ||
+      fsconfig(*fsfd, FSCONFIG_SET_FD, "workdir", nullptr, *work))
+    syserr("fsconfig(FSCONFIG_SET_FD)");
+  Fd mnt = make_mount(*fsfd);
+
   Fd olhome = ensure_dir(runhome(), "sandboxed-home", 0755, kFollow);
   xmnt_move(*mnt, *olhome);
+  restore = asuser();
   return xopenat(runhome(), "sandboxed-home",
                  O_RDONLY | O_CLOEXEC | O_DIRECTORY);
 }
@@ -359,6 +348,6 @@ main(int argc, char **argv)
 #if 1
   Config conf;
   conf.init();
-  conf.make_overlay();
+  conf.make_home_overlay();
 #endif
 }
