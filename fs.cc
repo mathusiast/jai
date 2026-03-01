@@ -217,7 +217,7 @@ open_lockfile(int dfd, const path &file)
         // Someone may have unlinked after completing setup; fail and
         // expect the invoker to call again if setup isn't complete.
         fd.reset();
-      if (!S_ISREG(sb.st_mode))
+      else if (!S_ISREG(sb.st_mode))
         err("{}: expected regular file", file.string());
       return fd;
     }

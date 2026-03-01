@@ -79,7 +79,7 @@ lock_or_validate_file(int dfd, const path &file, int flags, auto &&validate,
 void
 Config::init()
 {
-  char buf[512];
+  std::vector<char> buf;
   struct passwd pwbuf, *pw{};
 
   auto realuid = getuid();
@@ -92,12 +92,20 @@ Config::init()
   else if (const char *u = getenv("USER"))
     envuser = u;
 
-  if (realuid == 0 && envuser) {
-    if (getpwnam_r(envuser, &pwbuf, buf, sizeof(buf), &pw))
-      err("cannot find password entry for user {}", envuser);
+  for (;;) {
+    buf.resize(std::min(1uz, 2 * buf.size()));
+    if (realuid == 0 && envuser) {
+      if (int r = getpwnam_r(envuser, &pwbuf, buf.data(), buf.size(), &pw); !r)
+        break;
+      else if (r != ERANGE)
+        err("cannot find password entry for user {}", envuser);
+    }
+    else if (int r = getpwuid_r(realuid, &pwbuf, buf.data(), buf.size(), &pw);
+             !r)
+      break;
+    else if (r != ERANGE)
+      err("cannot find password entry for uid {}", uid_);
   }
-  else if (getpwuid_r(realuid, &pwbuf, buf, sizeof(buf), &pw))
-    err("cannot find password entry for uid {}", uid_);
 
   user_ = pw->pw_name;
   uid_ = pw->pw_uid;
@@ -305,17 +313,19 @@ Config::make_ns(const std::vector<path> &dirs)
 {
   Fd oldns = xopenat(-1, "/proc/self/ns/mnt", O_RDONLY);
   Defer restore{[fd = *oldns] { setns(fd, CLONE_NEWNS); }};
+  const mount_attr attr{
+      .attr_set = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID,
+      .propagation = MS_PRIVATE,
+  };
 
   Fd tmp = clone_tree(*make_private_tmp());
+  xmnt_setattr(*tmp, attr);
   Fd home = clone_tree(*make_home_overlay());
+  xmnt_setattr(*home, attr);
 
   unshare(CLONE_NEWNS);
   Fd newns = xopenat(-1, "/proc/self/ns/mnt", O_RDONLY);
-  xmnt_setattr(-1, "/",
-               mount_attr{
-                   .attr_set = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID,
-                   .propagation = MS_PRIVATE,
-               });
+  xmnt_setattr(-1, "/", attr);
 
   if (umount2(kRunRoot, MNT_DETACH))
     syserr("umount2({}, MNT_DETACH)", kRunRoot);
@@ -331,6 +341,7 @@ Config::make_ns(const std::vector<path> &dirs)
     setns(*oldns, CLONE_NEWNS);
     Fd src = clone_tree(*xopenat(-1, d, O_DIRECTORY | O_PATH));
     check_user(*src);
+    xmnt_setattr(*src, attr);
     setns(*newns, CLONE_NEWNS);
     Fd dst = xopenat(-1, d, O_DIRECTORY | O_PATH);
     check_user(*dst);
@@ -406,7 +417,7 @@ sanitize_env()
       sv = sv.substr(0, eq);
     for (std::string_view s : env_suffix_blacklist)
       if (sv.ends_with(s)) {
-        to_remove.push_back(*v);
+        to_remove.push_back(std::string{sv});
         break;
       }
   }
@@ -423,7 +434,7 @@ Config::run(int nsfd, const path &cwd, char **argv)
     syserr("fork");
   else if (pid != 0) {
     int status;
-    while (waitpid(pid, &status, 0) && errno == EINTR)
+    while (waitpid(pid, &status, 0) == -1 && errno == EINTR)
       ;
     if (WIFEXITED(status))
       exit(WEXITSTATUS(status));
