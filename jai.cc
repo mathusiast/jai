@@ -55,7 +55,8 @@ struct Config {
 
   [[nodiscard]] static Defer asuser(const Credentials *crp);
   [[nodiscard]] Defer asuser() { return asuser(&user_cred_); }
-  void check_user(int fd, std::string path_for_error = {});
+  void check_user(int fd, std::string path_for_error = {},
+                  bool untrusted_ok = false);
   Fd ensure_udir(int dfd, const path &p, mode_t perm = 0700,
                  FollowLinks follow = kFollow)
   {
@@ -157,11 +158,17 @@ Config::asuser(const Credentials *crp)
 }
 
 void
-Config::check_user(int fd, std::string p)
+Config::check_user(int fd, std::string p, bool untrusted_ok)
 {
-  if (auto sb = xfstat(fd); sb.st_uid != user_cred_.uid_)
-    err("{}: owned by {} should be owned by {}", p.empty() ? fdpath(fd) : p,
-        sb.st_uid, user_cred_.uid_);
+  if (auto sb = xfstat(fd); sb.st_uid != user_cred_.uid_) {
+    if (!untrusted_ok)
+      err("{}: owned by {} should be owned by {}", p.empty() ? fdpath(fd) : p,
+          sb.st_uid, user_cred_.uid_);
+    else if (sb.st_uid != untrusted_cred_.uid_)
+      err("{}: owned by {} should be owned by {} or {}",
+          p.empty() ? fdpath(fd) : p, sb.st_uid, user_cred_.uid_,
+          untrusted_cred_.uid_);
+  }
 }
 
 int
@@ -416,15 +423,16 @@ Config::make_mnt_ns(const std::vector<path> &dirs)
     xmnt_setattr(*src, attr);
 
     xsetns(*newns, CLONE_NEWNS);
-    restore_root = asuser(sbcred);
-    Fd dst;
-    if (fake_home_.empty()) {
-      dst = xopenat(-1, d, O_DIRECTORY | O_PATH | O_CLOEXEC);
-      check_user(*dst, d);
-    }
-    else
-      // XXX - possible TOCTTOU?
+    restore_root = asuser();
+    Fd dst = openat(-1, d.c_str(), O_DIRECTORY | O_PATH | O_CLOEXEC);
+    if (!dst) {
+      if (fake_home_.empty() || (errno != EACCES && errno != ENOENT))
+        syserr("{}", d.string());
+      restore_root.reset();
+      restore_root = asuser(sbcred);
       dst = ensure_dir(-1, d, 0755, kNoFollow, true);
+    }
+    check_user(*dst, d, true);
     restore_root.reset();
     xmnt_move(*src, *dst);
   }
