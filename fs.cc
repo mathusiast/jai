@@ -352,3 +352,26 @@ set_fd_acl(int fd, const char *acltext, AclType which)
   if (acl_set_file(procfd.c_str(), ACL_TYPE_DEFAULT, acl))
     syserr(R"(acl_set_file("{}", DEFAULT, {}))", fdpath(fd), acltext);
 }
+
+std::string
+read_file(int dfd, path file)
+{
+  Fd fdholder;
+  int fd = file.empty() ? dfd : *(fdholder = xopenat(fd, file, O_RDONLY));
+
+  std::string ret;
+  if (auto sb = xfstat(fd); sb.st_size > 0x100'0000)
+    // Let's not go crazy with sparse files and such
+    err("{}: file too large", fdpath(fd));
+  else if (sb.st_size > 0)
+    ret.reserve(sb.st_size);
+  for (;;) {
+    char buf[4096];
+    auto n = read(fd, buf, sizeof(buf));
+    if (n == 0)
+      return ret;
+    if (n < 0)
+      syserr("read {}", fdpath(fd));
+    ret.append(buf, size_t(n));
+  }
+}

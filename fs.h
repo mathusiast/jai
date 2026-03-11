@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <ranges>
 #include <set>
+#include <string>
 #include <string_view>
 
 #include <dirent.h>
@@ -243,6 +244,8 @@ xfstat(int fd)
     syserr(R"(fstat("{}"))", fdpath(fd));
   return sb;
 }
+
+std::string read_file(int dfd, path file = {});
 
 using ACL = RaiiHelper<acl_free, acl_t>;
 
