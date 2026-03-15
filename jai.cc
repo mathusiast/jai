@@ -27,6 +27,7 @@ struct Config {
   bool grant_cwd_{true};
   std::set<std::string> env_filter_;
   path cwd_;
+  std::string shellcmd_;
 
   std::string user_;
   path homepath_;
@@ -47,6 +48,8 @@ struct Config {
   void unmount();
   void unmountall();
   Options opt_parser();
+  void make_default_conf();
+  void sanitize_env();
 
   [[nodiscard]] static Defer asuser(const Credentials *crp);
   [[nodiscard]] Defer asuser() { return asuser(&user_cred_); }
@@ -434,7 +437,7 @@ Config::make_mnt_ns()
       if (cwd() == homepath_) {
         std::string name = prog.filename().string();
         std::println(
-R"({0}: Refusing to expose your entire home directory to sandbox.  Did
+            R"({0}: Refusing to expose your entire home directory to sandbox.  Did
 {1:>{2}}  you forget to specify the -D option?  If you really want to grant
 {1:>{2}}  permissions on your entire home directory, use both -D and -d, as in
 {1:>{2}}    {0} -Dd {3} ...)",
@@ -601,17 +604,37 @@ auto env_blacklist = std::to_array<const char *>({
     "*_TOKEN",
 });
 
+void
+Config::make_default_conf()
+{
+  auto fd = xopenat(home_jai(), ".", O_RDWR | O_TMPFILE | O_CLOEXEC, 0600);
+  std::string text;
+  for (auto e : env_blacklist)
+    text += std::format("unsetenv {}\n", e);
+  // The executed process will have PID 1, which can confuse some programs,
+  // so add "; exit $?" to force bash to stay around and be PID 1.
+  text += R"(command "$0" "$@"; exit $?)"
+          "\n";
+
+  errno = EAGAIN;
+  if (write(*fd, text.data(), text.size()) != text.size())
+    syserr("write(O_TMPFILE for default.conf)");
+  if (linkat(*fd, "", home_jai(), "default.conf", AT_EMPTY_PATH) &&
+      errno != EEXIST)
+    syserr("linkat({})", fdpath(home_jai(), "default.conf"));
+}
+
 extern "C" char **environ;
 
 void
-sanitize_env()
+Config::sanitize_env()
 {
   std::vector<std::string_view> patterns;
 
-  for (const char *v : env_blacklist) {
-    if (!std::strchr(v, '*'))
-      unsetenv(v);
-    else if (std::count(v, v + std::strlen(v), '*') <= 4)
+  for (const auto &v : env_filter_) {
+    if (v.find('*') == v.npos)
+      unsetenv(v.c_str());
+    else if (std::ranges::count(v, '*') <= 4)
       patterns.push_back(v);
     else
       // Too many *s could cause a lot of backtracking
@@ -674,8 +697,20 @@ Config::exec(int nsfd, char **argv)
     syserr("chdir({})", cwd().string());
   sanitize_env();
   umask(old_umask_);
-  execvp(argv[0], argv);
-  perror(argv[0]);
+  const char *argv0 = argv[0];
+  std::vector<const char *> bashcmd;
+  if (!shellcmd_.empty()) {
+    argv0 = PATH_BASH;
+    bashcmd.push_back("init");
+    bashcmd.push_back("-c");
+    bashcmd.push_back(shellcmd_.c_str());
+    while(*argv)
+      bashcmd.push_back(*(argv++));
+    bashcmd.push_back(nullptr);
+    argv = const_cast<char **>(bashcmd.data());
+  }
+  execvp(argv0, argv);
+  perror(argv0);
   _exit(1);
 }
 
@@ -709,6 +744,9 @@ Config::opt_parser()
       "--unsetenv",
       [this](std::string var) { env_filter_.emplace(std::move(var)); },
       "Remove VAR from environment (VAR can contain wildcard '*')", "VAR");
+  opts(
+      "--command", [this](std::string cmd) { shellcmd_ = std::move(cmd); },
+      R"(Bash command line to execute program (default: "$0" "$@"))", "CMD");
   return opts;
 }
 
@@ -770,26 +808,28 @@ do_main(int argc, char **argv)
     return;
   }
 
-  std::vector<path> cfs;
-  if (!cmd.empty() && conf.name_ok(cmd[0]))
-    cfs.push_back(cmd[0]);
-  cfs.push_back("default");
-  for (path p : cfs) {
+  auto tryparse = [&opts, &conf, argc, argv](path p) {
     if (!conf.name_ok(p))
-      continue;
+      return false;
     p += ".conf";
     if (Fd cf = openat(conf.home_jai(), p.c_str(), O_RDONLY)) {
       try {
         conf.opt_parser().parse_file(read_file(*cf));
+        // Re-parse argv so it takes precedence
+        opts.parse_argv(argc, argv);
+        return true;
       } catch (const Options::Error &e) {
         err<Options::Error>("{}:{}", fdpath(conf.home_jai(), p), e.what());
       }
-      // Re-parse CLI so it takes precedence
-      opts.parse_argv(argc, argv);
-      break;
     }
     if (errno != ENOENT)
       syserr("{}", fdpath(conf.home_jai(), p));
+    return false;
+  };
+
+  if (!(!cmd.empty() && tryparse(cmd[0])) && !tryparse("default")) {
+    conf.make_default_conf();
+    tryparse("default");
   }
 
   restore.reset();
@@ -809,8 +849,8 @@ main(int argc, char **argv)
   else
     prog = PACKAGE_TARNAME;
 
-  //do_main(argc, argv);
-  //return 0;
+  // do_main(argc, argv);
+  // return 0;
 
   try {
     do_main(argc, argv);

@@ -19,6 +19,9 @@ AC_LANG_POP([C++])
 PKG_CHECK_MODULES([MOUNT], [mount])
 PKG_CHECK_MODULES([LIBACL], [libacl])
 
+AC_PATH_PROG([PATH_BASH], [bash], [/bin/bash])
+AC_DEFINE_UNQUOTED([PATH_BASH], ["$PATH_BASH"], [Path to bash])
+
 # --with-untrusted-user=USER (default: auto-detect from password file or "jai")
 AC_ARG_WITH([untrusted-user],
   [AS_HELP_STRING([--with-untrusted-user=USER],
