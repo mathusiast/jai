@@ -5,6 +5,7 @@
 #include "err.h"
 
 #include <linux/sched.h>
+#include <sched.h>
 #include <signal.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -17,3 +18,11 @@ xfork(std::uint64_t flags = 0)
     return ret;
   syserr("clone3");
 }
+
+#define xsetns(fd, type)                                                       \
+  do {                                                                         \
+    if (setns(fd, type)) {                                                     \
+      syserr("setns({}, {})", fdpath(fd), #type);                              \
+      exit(1);                                                                 \
+    }                                                                          \
+  } while (0)

@@ -10,39 +10,27 @@
 #include <print>
 
 #include <acl/libacl.h>
-#include <dirent.h>
-#include <fcntl.h>
-#include <linux/futex.h>
-#include <sched.h>
-#include <sys/file.h>
-#include <sys/mount.h>
 #include <sys/prctl.h>
-#include <sys/stat.h>
-#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <unistd.h>
 
 path prog;
 
 constexpr const char *kUnstrustedUser = UNTRUSTED_USER;
 constexpr const char *kRunRoot = "/run/jai";
 
-#define xsetns(fd, type)                                                       \
-  do {                                                                         \
-    if (setns(fd, type)) {                                                     \
-      syserr("setns({}, {})", fdpath(fd), #type);                              \
-      exit(1);                                                                 \
-    }                                                                          \
-  } while (0)
-
 struct Config {
-  enum Mode { kCasual, kStrict };
+  enum Mode { kInvalidMode, kCasual, kStrict };
 
-  Mode mode_{kCasual};
+  Mode mode_{kInvalidMode};
+  PathSet grant_directories_;
+  bool grant_cwd_{true};
+  std::set<std::string> env_filter_;
+  path cwd_;
+
   std::string user_;
   path homepath_;
-  path sandbox_name_ = "default";
+  path sandbox_name_;
   Credentials user_cred_;
   Credentials untrusted_cred_;
   mode_t old_umask_ = 0755;
@@ -54,10 +42,11 @@ struct Config {
 
   void init_credentials();
   Fd make_idmap_ns();
-  Fd make_mnt_ns(const std::vector<path> &);
-  void exec(int nsfd, const path &cwd, char **argv);
+  Fd make_mnt_ns();
+  void exec(int nsfd, char **argv);
   void unmount();
   void unmountall();
+  Options opt_parser();
 
   [[nodiscard]] static Defer asuser(const Credentials *crp);
   [[nodiscard]] Defer asuser() { return asuser(&user_cred_); }
@@ -76,10 +65,24 @@ struct Config {
   int home_jai();
   int run_jai();
   int run_jai_user();
+  const path &cwd()
+  {
+    if (cwd_.empty()) {
+      auto restore = asuser();
+      cwd_ = canonical(std::filesystem::current_path());
+    }
+    return cwd_;
+  }
 
   Fd make_blacklist(int dfd, path name);
   Fd make_home_overlay();
   Fd make_private_tmp();
+
+  static bool name_ok(path p)
+  {
+    return p.is_relative() && std::ranges::distance(p.begin(), p.end()) == 1 &&
+           *p.c_str() != '.';
+  }
 };
 
 static std::expected<Fd, Defer>
@@ -378,10 +381,15 @@ Config::make_idmap_ns()
 }
 
 Fd
-Config::make_mnt_ns(const std::vector<path> &dirs)
+Config::make_mnt_ns()
 {
   Fd oldns = xopenat(-1, "/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
   Defer _restore_ns{[fd = *oldns] { xsetns(fd, CLONE_NEWNS); }};
+
+  if (mode_ == kInvalidMode)
+    mode_ = sandbox_name_.empty() ? kCasual : kStrict;
+  if (sandbox_name_.empty())
+    sandbox_name_ = "default";
 
   mount_attr attr{
       .attr_set = MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV,
@@ -421,14 +429,30 @@ Config::make_mnt_ns(const std::vector<path> &dirs)
   xmnt_move(*clone_tree(-1, "/tmp"), -1, "/var/tmp", 0);
   xmnt_move(*home, -1, homepath_);
 
-  for (auto d : dirs) {
+  if (grant_cwd_) {
+    if (!grant_directories_.contains(cwd())) {
+      if (cwd() == homepath_) {
+        std::string name = prog.filename().string();
+        std::println(
+R"({0}: Refusing to expose your entire home directory to sandbox.  Did
+{1:>{2}}  you forget to specify the -D option?  If you really want to grant
+{1:>{2}}  permissions on your entire home directory, use both -D and -d, as in
+{1:>{2}}    {0} -Dd {3} ...)",
+            name, "", name.size(), homepath_.string());
+        exit(1);
+      }
+      grant_directories_.emplace(cwd());
+    }
+  }
+
+  for (auto d : grant_directories_) {
     if (d.is_relative())
       d = "/" / d;
     xsetns(*oldns, CLONE_NEWNS);
     auto restore_root = asuser();
     Fd src = xopenat(-1, d, O_DIRECTORY | O_PATH | O_CLOEXEC);
     restore_root.reset();
-    src = clone_tree(*src);
+    src = clone_tree(*src); // Should it be recursive?
     xmnt_setattr(*src, attr);
 
     xsetns(*newns, CLONE_NEWNS);
@@ -610,7 +634,7 @@ sanitize_env()
 }
 
 void
-Config::exec(int nsfd, const path &cwd, char **argv)
+Config::exec(int nsfd, char **argv)
 {
   if (unshare(CLONE_NEWPID | CLONE_NEWIPC))
     syserr("unshare(CLONE_NEWPID)");
@@ -646,13 +670,46 @@ Config::exec(int nsfd, const path &cwd, char **argv)
     user_cred_.make_real();
   else
     untrusted_cred_.make_real();
-  if (chdir(cwd.c_str()))
-    syserr("chdir({})", cwd.string());
+  if (chdir(cwd().c_str()))
+    syserr("chdir({})", cwd().string());
   sanitize_env();
   umask(old_umask_);
   execvp(argv[0], argv);
   perror(argv[0]);
   _exit(1);
+}
+
+Options
+Config::opt_parser()
+{
+  Options opts;
+  opts(
+      "-d", "--dir",
+      [this](path d) { grant_directories_.emplace(canonical(d)); },
+      "Grant full access to DIR", "DIR");
+  opts(
+      "-D", "--nocwd", [this] { grant_cwd_ = false; },
+      "Do not grant access to current working directory");
+  opts(
+      "-n", "--name",
+      [this](path sb) {
+        if (!name_ok(sb))
+          err<Options::Error>("{}: invalid sandbox name", sb.string());
+        sandbox_name_ = sb;
+      },
+      "Use private or overlay home directory NAME", "NAME");
+  opts(
+      "--strict", [this] { mode_ = kStrict; },
+      std::format("Enable strict mode (run with uid {} and empty home)",
+                  kUnstrustedUser));
+  opts(
+      "--casual", [this] { mode_ = kCasual; },
+      "Enable casual mode (copy-on-write overlay home directory)");
+  opts(
+      "--unsetenv",
+      [this](std::string var) { env_filter_.emplace(std::move(var)); },
+      "Remove VAR from environment (VAR can contain wildcard '*')", "VAR");
+  return opts;
 }
 
 std::string option_help;
@@ -666,6 +723,18 @@ usage(int status)
   exit(status);
 }
 
+[[noreturn]] static void
+version()
+{
+  std::println(R"({}
+Copyright (C) 2026 David Mazieres
+This program comes with NO WARRANTY, to the extent permitted by law.
+You may redistribute it under the terms of the GNU General Public License
+version 3 or later; see the file named COPYING for details.)",
+               PACKAGE_STRING);
+  exit(0);
+}
+
 void
 do_main(int argc, char **argv)
 {
@@ -673,119 +742,62 @@ do_main(int argc, char **argv)
   conf.init_credentials();
   auto restore = conf.asuser();
 
-  bool opt_u{}, opt_D{};
+  bool opt_u{};
   std::vector<path> opt_d;
-  path cwd = canonical(std::filesystem::current_path());
-  bool set_mode = false;
 
-  Options opts;
-  opts(
-      "-d", "--dir", [&](path d) { opt_d.emplace_back(canonical(d)); },
-      "Enable full access to DIR", "DIR");
-  opts(
-      "-D", "--nocwd", [&] { opt_D = true; },
-      "Do not grant access to current working directory");
+  Options opts = conf.opt_parser();
+  // A few options not available in config files
   opts("-u", [&] { opt_u = true; }, "Unmount sandboxed file systems");
-  opts(
-      "-n", "--name",
-      [&](std::string optarg) {
-        conf.sandbox_name_ = optarg;
-        if (conf.sandbox_name_.is_absolute() ||
-            std::ranges::distance(conf.sandbox_name_.begin(),
-                                  conf.sandbox_name_.end()) != 1 ||
-            conf.sandbox_name_.c_str()[0] == '.') {
-          std::println(stderr, "{}: invalid sandbox name", optarg);
-          usage(2);
-        }
-      },
-      "Use private or overlay home directory NAME", "NAME");
-  opts(
-      "--strict",
-      [&] {
-        set_mode = true;
-        conf.mode_ = Config::kStrict;
-      },
-      "Enable strict mode");
-  opts(
-      "--casual",
-      [&] {
-        set_mode = true;
-        conf.mode_ = Config::kCasual;
-      },
-      "Enable casual mode");
-  opts("--version", [] {
-    std::println(R"({}
-Copyright (C) 2026 David Mazieres
-This program comes with NO WARRANTY, to the extent permitted by law.
-You may redistribute it under the terms of the GNU General Public License
-version 3 or later; see the file named COPYING for details.)",
-                 PACKAGE_STRING);
-    exit(0);
-  });
+  opts("--help", [] { usage(1); });
+  opts("--version", version, "Print copyright and version then exit");
   option_help = opts.help();
 
   std::vector<char *> cmd;
   try {
-    cmd.append_range(opts.parse_argv(argc, argv));
+    cmd.assign_range(opts.parse_argv(argc, argv));
   } catch (Options::Error &e) {
     std::println("{}", e.what());
     usage(2);
   }
-  if (!cmd.empty() && *cmd[0] != '.' && !strchr(cmd[0], '/')) {
-    path cfpath = std::format("{}.conf", cmd[0]);
-    Fd cf = openat(conf.home_jai(), cfpath.c_str(), O_RDONLY);
-    if (!cf) {
-      if (errno != ENOENT)
-        syserr("{}", fdpath(conf.home_jai(), cfpath));
-      cfpath = "default.conf";
-      Fd cf = openat(conf.home_jai(), cfpath.c_str(), O_RDONLY);
-      if (errno != ENOENT)
-        syserr("{}", fdpath(conf.home_jai(), cfpath));
+
+  if (opt_u) {
+    if (!conf.grant_cwd_ || !conf.grant_directories_.empty() || !cmd.empty()) {
+      std::println("-u is not compatible with -d, -D, or a command");
+      usage(2);
     }
-    if (cf)
+    restore.reset();
+    conf.unmountall();
+    return;
+  }
+
+  std::vector<path> cfs;
+  if (!cmd.empty() && conf.name_ok(cmd[0]))
+    cfs.push_back(cmd[0]);
+  cfs.push_back("default");
+  for (path p : cfs) {
+    if (!conf.name_ok(p))
+      continue;
+    p += ".conf";
+    if (Fd cf = openat(conf.home_jai(), p.c_str(), O_RDONLY)) {
       try {
-        opts.parse_file(read_file(*cf));
-      } catch (Options::Error &e) {
-        err<Options::Error>("{}:{}", fdpath(*cf), e.what());
+        conf.opt_parser().parse_file(read_file(*cf));
+      } catch (const Options::Error &e) {
+        err<Options::Error>("{}:{}", fdpath(conf.home_jai(), p), e.what());
       }
+      // Re-parse CLI so it takes precedence
+      opts.parse_argv(argc, argv);
+      break;
+    }
+    if (errno != ENOENT)
+      syserr("{}", fdpath(conf.home_jai(), p));
   }
 
   restore.reset();
 
-  if (!set_mode)
-    conf.mode_ =
-        conf.sandbox_name_ == "default" ? Config::kCasual : Config::kStrict;
-
-  if (opt_u) {
-    if (opt_D || !opt_d.empty() || !cmd.empty())
-      usage(2);
-    conf.unmountall();
-    return;
-  }
-  if (!opt_D && !std::ranges::contains(opt_d, cwd)) {
-    if (!cmd.empty() && cwd == canonical(conf.homepath_)) {
-      std::string name = prog.filename().string();
-      std::string cmdstr;
-      for (const auto &arg : cmd) {
-        if (!cmdstr.empty())
-          cmdstr += ' ';
-        cmdstr += arg;
-      }
-      std::println(
-          R"({0}: Refusing to expose your entire home directory to sandbox.  Did
-{1:>{2}}  you forget to specify the -D option?  If you really want to grant
-{1:>{2}}  permissions on your entire home directory, run
-{1:>{2}}    {0} -Dd {3} {4})",
-          name, "", name.size(), conf.homepath_.string(), cmdstr);
-      exit(1);
-    }
-    opt_d.emplace_back(cwd);
-  }
-
-  auto fd = conf.make_mnt_ns(opt_d);
+  auto fd = conf.make_mnt_ns();
   if (!cmd.empty()) {
     cmd.push_back(nullptr);
-    conf.exec(*fd, cwd, cmd.data());
+    conf.exec(*fd, cmd.data());
   }
 }
 
@@ -797,8 +809,8 @@ main(int argc, char **argv)
   else
     prog = PACKAGE_TARNAME;
 
-  do_main(argc, argv);
-  return 0;
+  //do_main(argc, argv);
+  //return 0;
 
   try {
     do_main(argc, argv);

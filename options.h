@@ -77,11 +77,11 @@
    $ ./myprog --help
    unknown option --help
    usage: ./myprog [OPTIONS] file1 [file2...]
-     --enable-a  enable a mode
+     --enable-a    enable a mode
      -o FILE, --output=FILE
-           specify FILE as the output file
+                   specify FILE as the output file
      -d[LEVEL], --debug[=LEVEL]
-           set debug level to LEVEL (default 5)
+                   set debug level to LEVEL (default 5)
 */
 
 #pragma once
@@ -240,6 +240,16 @@ public:
                    std::move(valname));
   }
 
+  void erase(std::string_view opt)
+  {
+#ifdef __cpp_lib_associative_heterogeneous_erasure
+    actions_.erase(opt);
+#else  // !__cpp_lib_associative_heterogeneous_erasure
+    if (auto it = actions_.find(opt); it != actions_.end())
+      actions_.erase(it);
+#endif // !__cpp_lib_associative_heterogeneous_erasure
+  }
+
   template<std::convertible_to<std::string_view> S>
   std::span<S> parse_argspan(std::span<S> args)
   {
@@ -361,8 +371,8 @@ public:
             optarg.resize(optarg.size() - 1);
         parse_argspan(std::span{&optarg, 1});
       } catch (const Error &e) {
-        auto lineno = std::count(text.begin(), text.begin() + clamp(pos), '\n');
-        err<Error>("{}:{}", lineno, e.what());
+        auto nnl = std::count(text.begin(), text.begin() + clamp(pos), '\n');
+        err<Error>("{}: {}", nnl + 1, e.what());
       }
     }
   }
