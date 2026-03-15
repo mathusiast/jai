@@ -1,5 +1,89 @@
 // -*-C++-*-
 
+/* Simple lambda based option parser.  Handles both command lines and
+   configuration files.  Given an object `Options o`, you can register
+   options in any of the following ways:
+
+     o(OPTION, LAMBDA [, HELP-STRING [, VALUE-STRING]]
+     o(OPTION1, OPTION2, LAMBDA [, HELP-STRING [, VALUE-STRING]]
+     o({OPTION1, ..., OPTION_N}, LAMBDA [, HELP-STRING [, VALUE-STRING]]
+
+   Each option can be a two character string literal starting with a
+   dash (e.g., "-o") or a three or more character string literal
+   starting with two dashes (e.g., "--add").  All options supplied in
+   the same invocation will have the same effect, which can be useful
+   for adding a short alias to a long option (e.g., "--debug" and "-d"
+   can mean the same thing).  VALUE-STRING is the name of the option
+   argument in the help string, and has no effect for options that do
+   not take arguments.
+
+   Whether or not an option takes an argument is determined by LAMBDA:
+
+   * If LAMBDA takes no arguments, the option takes no arguments.
+
+   * If LAMBDA takes an argument, the option takes an argument.
+     Arguments are converted from a std::string_view to the argument
+     type T by the function parseopt::option_convert<T>.  Currently
+     there are two overloads for converting strings and decimal
+     integers.  If you want to convert other types, you could
+     conceivably overload the function option_convert before including
+     this file, but you cannot currently use ADL since T is a template
+     argument, not a function argument.
+
+   * If LAMBDA has a default argument, the option takes an optional
+     argument.
+
+   You can parse command-line options with Options::parse_argv and a
+   configuration file with Options::parse_file.  When parsing a file,
+   only long options are supported, without the dashes.  For instance,
+   a configuration file line of the form "output myfile" is equivalent
+   to the option "--output=myfile".
+
+   Options::help() returns a help string.  Invalid options throw the
+   Options::Error exception.  Here is some example usage:
+
+   // -----------------------------------------------------------
+
+   bool enable_a = false;
+   int debug_level = 0;
+   std::string output;
+
+   Options o;
+
+   // Option that takes no arguments
+   o("--enable-a", [&] { enable_a = true; }, "enable a mode");
+
+   // Option that takes an argument
+   o("-o", "--output", [&](std::string arg) { output = arg; },
+     "specify FILE as the output file", "FILE");
+
+   // Option that takes an optional argument
+   o("-d", "--debug", [&](int lvl = 5) { debug_level = lvl; },
+     "set debug level to LEVEL (default 5)", "LEVEL");
+
+   std::span<char *> args;      // non-option arguments
+   try {
+     args = o.parse_argv(argc, argv);
+   } catch (const Options::Error &e) {
+     std::print(stderr, "{}\nusage: {} [OPTIONS] file1 [file2...]\n{}",
+                e.what(), argv[0], o.help());
+     exit(1);
+   }
+
+   // -----------------------------------------------------------
+
+   On error, the above code will print an error message like this:
+
+   $ ./myprog --help
+   unknown option --help
+   usage: ./myprog [OPTIONS] file1 [file2...]
+     --enable-a  enable a mode
+     -o FILE, --output=FILE
+           specify FILE as the output file
+     -d[LEVEL], --debug[=LEVEL]
+           set debug level to LEVEL (default 5)
+*/
+
 #pragma once
 
 #include "err.h"
@@ -10,7 +94,6 @@
 #include <format>
 #include <initializer_list>
 #include <map>
-#include <ranges>
 #include <span>
 #include <utility>
 
@@ -103,6 +186,7 @@ struct Option : std::string_view {
 class Options {
 public:
   using enum Action::HasArg;
+  using Error = OptionError;
 
   Options &operator()(std::initializer_list<Option> options, is_action auto f,
                       std::string helpstr = {}, std::string valname = {})
@@ -144,9 +228,15 @@ public:
   {
     return (*this)({opt}, std::move(f), std::move(helpstr), std::move(valname));
   }
+  Options &operator()(Option opt1, Option opt2, is_action auto f,
+                      std::string helpstr = {}, std::string valname = {})
+  {
+    return (*this)({opt1, opt2}, std::move(f), std::move(helpstr),
+                   std::move(valname));
+  }
 
   template<std::convertible_to<std::string_view> S>
-  std::span<S> parse_cli(std::span<S> args)
+  std::span<S> parse_argspan(std::span<S> args)
   {
     for (size_t i = 0; i < args.size(); ++i) {
       auto optarg = std::string_view(args[i]);
@@ -200,8 +290,9 @@ public:
 
   std::span<char *> parse_argv(int argc, char **argv)
   {
-    return parse_cli(std::span{argv + 1, argv + argc});
+    return parse_argspan(std::span{argv + 1, argv + argc});
   }
+
   void parse_file(std::string_view text)
   {
     static constexpr std::string_view ws = " \t\r";
@@ -220,7 +311,7 @@ public:
       optarg += text.substr(pos, optend - pos);
       if ((pos = text.find_first_not_of(ws, optend)) >= sz ||
           text[pos] == '\n') {
-        parse_cli(std::span{&optarg, 1});
+        parse_argspan(std::span{&optarg, 1});
         continue;
       }
       optarg += '=';
@@ -260,7 +351,7 @@ public:
       if (!last_escaped)
         while (wsnl.contains(optarg.back()))
           optarg.resize(optarg.size() - 1);
-      parse_cli(std::span{&optarg, 1});
+      parse_argspan(std::span{&optarg, 1});
     }
   }
 
