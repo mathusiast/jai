@@ -762,7 +762,7 @@ Config::opt_parser()
       "Use private or overlay home directory NAME", "NAME");
   opts("--conf", [this, opts = ret.get()](path file) {
     if (!parse_config_file(file, opts))
-      warn("{}: configuration file not found", file.string());
+      err<Options::Error>("{}: configuration file not found", file.string());
   });
   opts(
       "--strict", [this] { mode_ = kStrict; },
@@ -821,8 +821,8 @@ do_main(int argc, char **argv)
   // Override inline conf to make CLI idempotent
   (*opts)(
       "-C", "--conf", [&](path p) { opt_C = p; },
-      R"(Use FILE as configuration file (relative to ~/.jai).
-Default: CMD.conf or default.conf if CMD.conf does not exist)",
+      R"(Use FILE as configuration file (relative to ~/.jai)
+default: CMD.conf or default.conf if CMD.conf does not exist)",
       "FILE");
   (*opts)("--help", [] { usage(1); });
   (*opts)("--version", version, "Print copyright and version then exit");
@@ -870,9 +870,6 @@ main(int argc, char **argv)
     prog = argv[0];
   else
     prog = PACKAGE_TARNAME;
-
-  // do_main(argc, argv);
-  // return 0;
 
   try {
     do_main(argc, argv);

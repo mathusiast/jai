@@ -22,7 +22,7 @@ xfork(std::uint64_t flags = 0)
 #define xsetns(fd, type)                                                       \
   do {                                                                         \
     if (setns(fd, type)) {                                                     \
-      syserr("setns({}, {})", fdpath(fd), #type);                              \
+      warn("setns({}, {}): {}", fdpath(fd), #type, strerror(errno));           \
       exit(1);                                                                 \
     }                                                                          \
   } while (0)
