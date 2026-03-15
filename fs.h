@@ -42,12 +42,13 @@ struct PathLess {
   }
 };
 
-using PathSet = std::multiset<path, PathLess>;
+using PathSet = std::set<path, PathLess>;
+using PathMultiset = std::multiset<path, PathLess>;
 
 // Return a range for a subtree rooted at root.  root itself will be
 // returned only if it does not contain a trailing slash.
 inline auto
-subtree(const PathSet &s, const path &root)
+subtree(const is_one_of<PathSet, PathMultiset> auto &s, const path &root)
 {
   if (root.relative_path().empty())
     return std::ranges::subrange(s.begin(), s.end());
@@ -62,7 +63,7 @@ subtree(const PathSet &s, const path &root)
 
 // Return a subtree in reverse order (suitable for unmounting).
 inline auto
-subtree_rev(const PathSet &s, const path &root)
+subtree_rev(const is_one_of<PathSet, PathMultiset> auto &s, const path &root)
 {
   return subtree(s, root) | std::views::reverse;
 }
@@ -70,7 +71,7 @@ subtree_rev(const PathSet &s, const path &root)
 std::string fdpath(int fd, const path &file, bool must = false);
 std::string fdpath(int fd, bool must = false);
 
-PathSet mountpoints(const path &mountinfo = "/proc/self/mountinfo");
+PathMultiset mountpoints(const path &mountinfo = "/proc/self/mountinfo");
 
 // source (if non-NULL) is the source printed in /proc/self/mountinfo
 Fd xfsopen(const char *fsname, const char *source = nullptr);
@@ -245,7 +246,17 @@ xfstat(int fd)
   return sb;
 }
 
-std::string read_file(int dfd, path file = {});
+std::expected<std::string, std::system_error> try_read_file(int dfd,
+                                                            path file = {});
+
+inline std::string
+read_file(int dfd, path file = {})
+{
+  if (auto res = try_read_file(dfd, file))
+    return std::move(*res);
+  else
+    throw res.error();
+}
 
 using ACL = RaiiHelper<acl_free, acl_t>;
 

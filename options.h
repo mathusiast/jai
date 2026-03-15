@@ -308,7 +308,7 @@ public:
     return parse_argspan(std::span{argv + 1, argv + argc});
   }
 
-  void parse_file(std::string_view text)
+  void parse_file(std::string_view text, std::string_view errpath = {})
   {
     static constexpr std::string_view ws = " \t\r";
     static constexpr std::string_view wsnl = " \t\r\n";
@@ -371,8 +371,10 @@ public:
             optarg.resize(optarg.size() - 1);
         parse_argspan(std::span{&optarg, 1});
       } catch (const Error &e) {
+        if (errpath.empty())
+          throw;
         auto nnl = std::count(text.begin(), text.begin() + clamp(pos), '\n');
-        err<Error>("{}: {}", nnl + 1, e.what());
+        err<Error>("{}:{}: {}", errpath, nnl + 1, e.what());
       }
     }
   }

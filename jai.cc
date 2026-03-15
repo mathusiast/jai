@@ -41,14 +41,18 @@ struct Config {
   Fd run_jai_fd_;
   Fd run_jai_user_fd_;
 
+  PathSet config_loop_detect_;
+
   void init_credentials();
   Fd make_idmap_ns();
   Fd make_mnt_ns();
   void exec(int nsfd, char **argv);
   void unmount();
   void unmountall();
-  Options opt_parser();
+  std::unique_ptr<Options> opt_parser();
   void make_default_conf();
+
+  bool parse_config_file(path file, Options *opts = nullptr);
   void sanitize_env();
 
   [[nodiscard]] static Defer asuser(const Credentials *crp);
@@ -87,6 +91,29 @@ struct Config {
            *p.c_str() != '.';
   }
 };
+
+bool
+Config::parse_config_file(path file, Options *opts)
+{
+  auto ld = homepath_ / file;
+  if (auto [_it, ok] = config_loop_detect_.insert(ld); !ok) {
+    warn("{}: configuration loop", file.string());
+    return false;
+  }
+  Defer _clear{[this, ld = std::move(ld)] { config_loop_detect_.erase(ld); }};
+
+  auto r = try_read_file(home_jai(), file);
+  if (!r) {
+    if (r.error().code() == std::errc::no_such_file_or_directory)
+      return false;
+    throw r.error();
+  }
+  if (opts)
+    opts->parse_file(*r, fdpath(home_jai(), file));
+  else
+    opt_parser()->parse_file(*r, fdpath(home_jai(), file));
+  return true;
+}
 
 static std::expected<Fd, Defer>
 lock_or_validate_file(int dfd, const path &file, int flags, auto &&validate,
@@ -139,15 +166,14 @@ Config::init_credentials()
         !strcmp(u->pw_dir, "/"))
       untrusted_cred_ = Credentials::get_user(u);
     else
-      std::println(stderr,
-                   R"(Ignoring user {} because uid is 0, home dir is not "/" or
+      warn(R"(Ignoring user {} because uid is 0, home dir is not "/" or
 GECOS field is not "JAI sandbox untrusted user")",
-                   kUnstrustedUser);
+           kUnstrustedUser);
   }
   else
-    std::println(stderr, R"(Could not find credentials for untrusted {} user.
+    warn(R"(Could not find credentials for untrusted {} user.
 Try running "sudo systemd-sysusers".)",
-                 kUnstrustedUser);
+         kUnstrustedUser);
 
   // Paranoia about ptrace, because we will drop privileges to access
   // the file system as the user.
@@ -704,7 +730,7 @@ Config::exec(int nsfd, char **argv)
     bashcmd.push_back("init");
     bashcmd.push_back("-c");
     bashcmd.push_back(shellcmd_.c_str());
-    while(*argv)
+    while (*argv)
       bashcmd.push_back(*(argv++));
     bashcmd.push_back(nullptr);
     argv = const_cast<char **>(bashcmd.data());
@@ -714,10 +740,11 @@ Config::exec(int nsfd, char **argv)
   _exit(1);
 }
 
-Options
+std::unique_ptr<Options>
 Config::opt_parser()
 {
-  Options opts;
+  auto ret = std::make_unique<Options>();
+  Options &opts = *ret;
   opts(
       "-d", "--dir",
       [this](path d) { grant_directories_.emplace(canonical(d)); },
@@ -733,6 +760,10 @@ Config::opt_parser()
         sandbox_name_ = sb;
       },
       "Use private or overlay home directory NAME", "NAME");
+  opts("--conf", [this, opts = ret.get()](path file) {
+    if (!parse_config_file(file, opts))
+      warn("{}: configuration file not found", file.string());
+  });
   opts(
       "--strict", [this] { mode_ = kStrict; },
       std::format("Enable strict mode (run with uid {} and empty home)",
@@ -747,7 +778,7 @@ Config::opt_parser()
   opts(
       "--command", [this](std::string cmd) { shellcmd_ = std::move(cmd); },
       R"(Bash command line to execute program (default: "$0" "$@"))", "CMD");
-  return opts;
+  return ret;
 }
 
 std::string option_help;
@@ -782,17 +813,24 @@ do_main(int argc, char **argv)
 
   bool opt_u{};
   std::vector<path> opt_d;
+  path opt_C = "";
 
-  Options opts = conf.opt_parser();
+  auto opts = conf.opt_parser();
   // A few options not available in config files
-  opts("-u", [&] { opt_u = true; }, "Unmount sandboxed file systems");
-  opts("--help", [] { usage(1); });
-  opts("--version", version, "Print copyright and version then exit");
-  option_help = opts.help();
+  (*opts)("-u", [&] { opt_u = true; }, "Unmount sandboxed file systems");
+  // Override inline conf to make CLI idempotent
+  (*opts)(
+      "-C", "--conf", [&](path p) { opt_C = p; },
+      R"(Use FILE as configuration file (relative to ~/.jai).
+Default: CMD.conf or default.conf if CMD.conf does not exist)",
+      "FILE");
+  (*opts)("--help", [] { usage(1); });
+  (*opts)("--version", version, "Print copyright and version then exit");
+  option_help = opts->help();
 
   std::vector<char *> cmd;
   try {
-    cmd.assign_range(opts.parse_argv(argc, argv));
+    cmd.assign_range(opts->parse_argv(argc, argv));
   } catch (Options::Error &e) {
     std::println("{}", e.what());
     usage(2);
@@ -808,28 +846,12 @@ do_main(int argc, char **argv)
     return;
   }
 
-  auto tryparse = [&opts, &conf, argc, argv](path p) {
-    if (!conf.name_ok(p))
-      return false;
-    p += ".conf";
-    if (Fd cf = openat(conf.home_jai(), p.c_str(), O_RDONLY)) {
-      try {
-        conf.opt_parser().parse_file(read_file(*cf));
-        // Re-parse argv so it takes precedence
-        opts.parse_argv(argc, argv);
-        return true;
-      } catch (const Options::Error &e) {
-        err<Options::Error>("{}:{}", fdpath(conf.home_jai(), p), e.what());
-      }
-    }
-    if (errno != ENOENT)
-      syserr("{}", fdpath(conf.home_jai(), p));
-    return false;
-  };
-
-  if (!(!cmd.empty() && tryparse(cmd[0])) && !tryparse("default")) {
+  if (opt_C.empty() && !cmd.empty() && conf.name_ok(cmd[0]))
+    opt_C = std::format("{}.conf", cmd[0]);
+  if ((opt_C.empty() || !conf.parse_config_file(opt_C)) &&
+      !conf.parse_config_file("default.conf")) {
     conf.make_default_conf();
-    tryparse("default");
+    conf.parse_config_file("default.conf");
   }
 
   restore.reset();

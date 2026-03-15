@@ -66,7 +66,7 @@ fdpath(int fd, const path &file, bool must)
   return res;
 }
 
-PathSet
+PathMultiset
 mountpoints(const path &mountinfo)
 {
   RaiiHelper<mnt_unref_table> t = mnt_new_table();
@@ -79,7 +79,7 @@ mountpoints(const path &mountinfo)
   if (!i)
     err("mnt_new_iter(MNT_ITER_FORWARD) failed");
 
-  PathSet res;
+  PathMultiset res;
   libmnt_fs *mp = nullptr;
   while (!mnt_table_next_fs(t, i, &mp))
     if (const char *target = mnt_fs_get_target(mp))
@@ -155,10 +155,9 @@ recursive_umount(const path &tree, bool detach)
   auto dirs = subtree_rev(mps, tree);
   for (const auto &dir : dirs) {
     if (umount2(dir.c_str(), UMOUNT_NOFOLLOW)) {
-      std::println(stderr, R"(umount("{}"): {})", dir.string(),
-                   strerror(errno));
+      warn(R"(umount("{}"): {})", dir.string(), strerror(errno));
       if (detach && umount2(dir.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH) == 0)
-        std::println(stderr, "did lazy unmount of {}\n", dir.string());
+        warn("did lazy unmount of {}\n", dir.string());
     }
   }
 }
@@ -353,11 +352,18 @@ set_fd_acl(int fd, const char *acltext, AclType which)
     syserr(R"(acl_set_file("{}", DEFAULT, {}))", fdpath(fd), acltext);
 }
 
-std::string
-read_file(int dfd, path file)
+std::expected<std::string, std::system_error>
+try_read_file(int dfd, path file)
 {
   Fd fdholder;
-  int fd = file.empty() ? dfd : *(fdholder = xopenat(fd, file, O_RDONLY));
+  int fd = dfd;
+  if (!file.empty()) {
+    fdholder = openat(fd, file.c_str(), O_RDONLY, O_CLOEXEC);
+    if (!fdholder)
+      return std::unexpected(
+          std::system_error(errno, std::system_category(), fdpath(fd, file)));
+    fd = *fdholder;
+  }
 
   std::string ret;
   if (auto sb = xfstat(fd); sb.st_size > 0x100'0000)
@@ -371,7 +377,8 @@ read_file(int dfd, path file)
     if (n == 0)
       return ret;
     if (n < 0)
-      syserr("read {}", fdpath(fd));
+      return std::unexpected(
+          std::system_error(errno, std::system_category(), fdpath(fd, file)));
     ret.append(buf, size_t(n));
   }
 }
