@@ -114,7 +114,7 @@ make_tmpfs(const char *source, Opt... opt)
   return make_mount(*conf);
 }
 
-void recursive_umount(const path &tree, bool detach = true);
+bool recursive_umount(const path &tree, bool detach = true);
 
 enum class FollowLinks {
   kNoFollow = 0,
@@ -196,12 +196,11 @@ xopenat(int dfd, const path &file, int flags, mode_t mode = 0755)
 }
 
 inline Fd
-xdup(int fd)
+xdup(int fd, int minfd = 3)
 {
-  auto ret = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+  auto ret = fcntl(fd, F_DUPFD_CLOEXEC, minfd);
   if (ret == -1)
-    syserr("F_DUPFD_CLOEXEC");
-  fcntl(ret, F_SETFD, 1);
+    syserr("{}: F_DUPFD_CLOEXEC", fdpath(fd));
   return ret;
 }
 

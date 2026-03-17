@@ -5,8 +5,10 @@
 #include "options.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <linux/prctl.h>
 #include <print>
 
 #include <acl/libacl.h>
@@ -44,6 +46,9 @@ struct Config {
   Fd home_jai_fd_;
   Fd run_jai_fd_;
   Fd run_jai_user_fd_;
+
+  // Hold some file descriptors to prevent unmounting
+  std::vector<Fd> mp_holder_;
 
   PathSet config_loop_detect_;
 
@@ -375,6 +380,7 @@ Config::make_idmap_ns()
   });
   auto pfds = xpipe();
   if (!(pid = xfork(CLONE_NEWUSER))) {
+    prctl(PR_SET_PDEATHSIG, SIGKILL);
     pfds[1].reset();
     char c;
     read(*pfds[0], &c, 1);
@@ -418,13 +424,13 @@ Config::make_mnt_ns()
       .attr_set = MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV,
       .propagation = MS_PRIVATE,
   };
-  Fd tmp = clone_tree(*make_private_tmp());
+  Fd tmp = clone_tree(*mp_holder_.emplace_back(make_private_tmp()));
 
   Fd home;
   Fd mapns;
   Credentials *sbcred = &user_cred_;
   if (mode_ == kCasual)
-    home = clone_tree(*make_home_overlay());
+    home = clone_tree(*mp_holder_.emplace_back(make_home_overlay()));
   else {
     if (mode_ == kStrict) {
       sbcred = &untrusted_cred_;
@@ -555,7 +561,8 @@ Config::unmountall()
 
   auto dir = xopendir(run_jai_user());
   while (auto de = readdir(dir))
-    unlinkat(run_jai_user(), de->d_name, AT_REMOVEDIR);
+    if (unlinkat(run_jai_user(), de->d_name, AT_REMOVEDIR) && errno == ENOTDIR)
+      unlinkat(run_jai_user(), de->d_name, 0);
 
   // Get rid of any stale files the user can't delete
   try {
@@ -638,16 +645,32 @@ Config::exec(int nsfd, char **argv)
   if (auto pid = xfork()) {
     close(nsfd);
     int status = -1;
-    while (waitpid(pid, &status, 0) == -1 && errno == EINTR)
-      ;
-    // unmount();
-    if (WIFEXITED(status))
-      exit(WEXITSTATUS(status));
-    if (WIFSIGNALED(status)) {
-      signal(WTERMSIG(status), SIG_DFL);
-      raise(WTERMSIG(status));
+    for (;;) {
+      int r = waitpid(pid, &status, WUNTRACED);
+      std::println(stderr, "waitpid -> pid = {}, status = 0x{:x}", r, status);
+      if (r != pid) {
+        if (r == -1 && errno != EINTR)
+          syserr("waitpid");
+      }
+      else if (WIFSTOPPED(status)) {
+        // Because the child is in its own PID namespace, it cannot
+        // stop us if it tries to suspend the process group.  Hence,
+        // detect if the child stopped and stop ourselves.
+        if (int sig = WSTOPSIG(status); sig == SIGSTOP || sig == SIGTSTP ||
+                                        sig == SIGTTIN || sig == SIGTTOU)
+          raise(sig);
+      }
+      else {
+        // unmount();
+        if (WIFEXITED(status))
+          exit(WEXITSTATUS(status));
+        if (WIFSIGNALED(status)) {
+          signal(WTERMSIG(status), SIG_DFL);
+          raise(WTERMSIG(status));
+        }
+        err("unknown child wait status 0x{:x}", status);
+      }
     }
-    _exit(1);
   }
 
   try {
@@ -847,9 +870,17 @@ main(int argc, char **argv)
   else
     prog = PACKAGE_TARNAME;
 
+#if 1
+  using ToCatch = std::exception;
+#else
+  struct ToCatch {
+    auto what() const { return ""; }
+  };
+#endif
+
   try {
     do_main(argc, argv);
-  } catch (const std::exception &e) {
+  } catch (const ToCatch &e) {
     warn("{}", e.what());
     return 1;
   }

@@ -148,9 +148,10 @@ xmnt_propagate(int fd, std::uint64_t propagation, bool recursive)
   xmnt_setattr(fd, a, recursive ? AT_RECURSIVE : 0);
 }
 
-void
+bool
 recursive_umount(const path &tree, bool detach)
 {
+  bool ret = true;
   auto mps = mountpoints();
   auto dirs = subtree_rev(mps, tree);
   for (const auto &dir : dirs) {
@@ -158,8 +159,11 @@ recursive_umount(const path &tree, bool detach)
       warn(R"(umount("{}"): {})", dir.string(), strerror(errno));
       if (detach && umount2(dir.c_str(), UMOUNT_NOFOLLOW | MNT_DETACH) == 0)
         warn("did lazy unmount of {}\n", dir.string());
+      else
+        ret = false;
     }
   }
+  return ret;
 }
 
 bool
