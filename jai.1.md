@@ -8,8 +8,7 @@ jai - Jail an AI agent
 
 # SYNOPSIS
 
-`jai` [*option*]...  *cmd* [*arg*]... \
-`jai` [*option*]... \
+`jai` [*option*]...  [*cmd* [*arg*]...] \
 `jai` `-u`
 
 # DESCRIPTION
@@ -32,6 +31,8 @@ read most sensitive files on the system.  In other words, jai prevents
 *cmd* from clobbering all your files, but doesn't provide much
 confidentiality.
 
+If you don't specify *cmd*, jai will launch a jailed shell by default.
+
 If you run `jai -mstrict` *cmd* [*arg*]...", then *cmd* will be run
 with an empty home directory as an unprivileged user id, but with the
 current working directory mapped to its place and fully exposed.
@@ -52,7 +53,7 @@ want to grant access to the current working directory, use the `-D`
 option.
 
 If you use casual mode and forget to export some directory that you
-wanted the mailed tool to update, you will find changed files in
+updated in the jail, you will find changed files in
 `$HOME/.jai/default.changes`.  You can destroy the sandbox with `jai
 -u`, move the changed files back into your home directory, and re-run
 `jai` with the appropriate `-d` flag.
@@ -61,8 +62,8 @@ jai allows the use of multiple sandboxed home directories.  To use a
 home directory other than the default, just give it a name with the
 `-n` option and it will be created on demand.  When you specify a home
 directory with `-n`, strict mode becomes the default (unless there is
-no unprivileged `jai` user on your system, in which case it falls back
-to bare mode).  It is possible to have multiple home overlays by
+no unprivileged `jai` user on your system, in which case jai falls
+back to bare mode).  It is possible to have multiple home overlays by
 specifying `-mcasual` with `-n`.
 
 # CONFIGURATION
@@ -84,8 +85,8 @@ configuration file.  (Relative paths are relative to `$HOME/.jai/`.)
 
 jai executes programs with bash.  The `command` directive allows you
 to reconfigure the environment or add command-line options to certain
-commands.  For instance, you might create a file `python.conf` with
-the following:
+commands.  For instance, to use a python virtual environment in a
+jail, you might create a file `python.conf` with the following:
 
     conf default.conf
     mode strict
@@ -93,8 +94,8 @@ the following:
     name python
     command source $HOME/venv/bin/activate; "$0" "$@"
 
-Then when running `jai python`, this configuration file will load a
-virtual environment before running the command.
+If you run `jai python`, this configuration file will load a virtual
+environment before running the command.
 
 # EXAMPLES
 

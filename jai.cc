@@ -935,7 +935,10 @@ default: CMD.conf or default.conf if CMD.conf does not exist)",
   (*opts)("--version", version, "Print copyright and version then exit");
   (*opts)(
       "--print-default-conf",
-      [] { write(1, default_conf.data(), default_conf.size()); },
+      [] {
+        write(1, default_conf.data(), default_conf.size());
+        exit(0);
+      },
       "Show contents of the default configuration file");
   option_help = opts->help();
 
@@ -972,11 +975,14 @@ default: CMD.conf or default.conf if CMD.conf does not exist)",
 
   restore.reset();
 
-  auto fd = conf.make_mnt_ns();
-  if (!cmd.empty()) {
-    cmd.push_back(nullptr);
-    conf.exec(*fd, cmd.data());
+  if (cmd.empty()) {
+    const char *shell = conf.shell_.empty() ? "/bin/sh" : conf.shell_.c_str();
+    cmd.push_back(const_cast<char *>(shell));
   }
+
+  auto fd = conf.make_mnt_ns();
+  cmd.push_back(nullptr);
+  conf.exec(*fd, cmd.data());
 }
 
 int
