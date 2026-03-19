@@ -201,6 +201,19 @@ environment before running the command.
   processes, you might as well filter any PIDs exposed in environment
   variables to avoid confusion.)
 
+`--setenv` *var*, `--setenv` *var*`=`*value*
+: There are two forms of this command.  If the argument does not
+  contain `=`, then `--setenv` reverses the effect of `--unsetenv`
+  *var*.  If *var* is a pattern, it must exactly match the unset
+  pattern you want to remove.  For example, `--unsetenv=*_PASSWORD
+  --setenv=IPMI_PASSWORD` and `--unsetenv=*_PASSWORD
+  --setenv=IPMI_PASSWORD` will both pass the `IPMI_PASSWORD`
+  environment variable through to the jail, while
+  `--unsetenv=*_PASSWORD --setenv=IPMI_*` will not.
+
+    If the argument contains `=`, then *var* is always treated as a
+  variable, not a pattern, and it is assigned *value* in the jail.
+
 `--command` *bash-command*
 : jai launches the sandboxed program you specify by running
   "`/bin/bash -c` *bash-command* *cmd* *arg*...".  By default,
@@ -284,5 +297,3 @@ these up if you are unable to delete them.
 In general overlayfs can be flaky.  If the attributes on the
 `default.changes` directory get out of sync, it may require making a
 new `default.changes` directory to get around mounting errors.
-
-There is no way to reverse an `unsetenv` configuration option.

@@ -13,6 +13,7 @@
 
 #include <acl/libacl.h>
 #include <pwd.h>
+#include <ranges>
 #include <sys/prctl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -29,7 +30,8 @@ struct Config {
   Mode mode_{kInvalidMode};
   PathSet grant_directories_;
   bool grant_cwd_{true};
-  std::set<std::string> env_filter_;
+  std::set<std::string, std::less<>> env_filter_;
+  std::map<std::string, std::string, std::less<>> setenv_;
   path cwd_;
   std::string shellcmd_;
   PathSet mask_files_;
@@ -65,7 +67,7 @@ struct Config {
   void make_default_conf();
 
   bool parse_config_file(path file, Options *opts = nullptr);
-  void sanitize_env();
+  std::vector<const char *> make_env();
 
   [[nodiscard]] static Defer asuser(const Credentials *crp);
   [[nodiscard]] Defer asuser() { return asuser(&user_cred_); }
@@ -667,34 +669,36 @@ Config::make_default_conf()
 
 extern "C" char **environ;
 
-void
-Config::sanitize_env()
+std::vector<const char *>
+Config::make_env()
 {
-  std::vector<std::string_view> patterns;
-
-  for (const auto &v : env_filter_) {
+  std::vector<std::string_view> filter_patterns;
+  std::set<std::string_view, std::less<>> filter_vars;
+  for (const auto &v : env_filter_)
     if (v.find('*') == v.npos)
-      unsetenv(v.c_str());
-    else if (std::ranges::count(v, '*') <= 4)
-      patterns.push_back(v);
+      filter_vars.insert(v);
     else
-      // Too many *s could cause a lot of backtracking
-      warn(R"(ignoring env pattern "{}" with too many '*'s)", v);
-  }
+      filter_patterns.push_back(v);
 
-  std::vector<std::string> to_remove;
-  for (char **v = environ; *v; ++v) {
-    std::string_view sv(*v);
+  for (char **e = environ; *e; ++e) {
+    std::string_view sv(*e);
     if (auto eq = sv.find('='); eq != sv.npos)
       sv = sv.substr(0, eq);
-    for (auto pat : patterns)
-      if (glob(pat, sv)) {
-        to_remove.push_back(std::string{sv});
-        break;
-      }
+    else
+      continue;
+    if (filter_vars.contains(sv) ||
+        std::ranges::any_of(filter_patterns,
+                            [sv](auto pat) { return glob(pat, sv); }))
+      continue;
+    setenv_.try_emplace(std::string(sv), *e);
   }
-  for (const auto &v : to_remove)
-    unsetenv(v.c_str());
+
+  std::vector<const char *> ret(std::from_range,
+                                setenv_ | std::views::transform([](auto &kv) {
+                                  return kv.second.c_str();
+                                }));
+  ret.push_back(nullptr);
+  return ret;
 }
 
 // Exits if child pid exited, returns stop signal if pid stopped
@@ -739,6 +743,8 @@ again:
 void
 Config::exec(int nsfd, char **argv)
 {
+  auto env = make_env();
+
   // This function is a bit annoying because the existing jai process
   // cannot move to a new PID namespace, so we have to fork once.  But
   // the forked process will have PID 1 and behave strangely (such as
@@ -810,7 +816,6 @@ Config::exec(int nsfd, char **argv)
       untrusted_cred_.make_real();
     if (chdir(cwd().c_str()))
       syserr("chdir({})", cwd().string());
-    sanitize_env();
     umask(old_umask_);
     const char *argv0 = argv[0];
     std::vector<const char *> bashcmd;
@@ -824,7 +829,7 @@ Config::exec(int nsfd, char **argv)
       bashcmd.push_back(nullptr);
       argv = const_cast<char **>(bashcmd.data());
     }
-    execvp(argv0, argv);
+    execvpe(argv0, argv, const_cast<char **>(env.data()));
     perror(argv0);
     _exit(1);
   } catch (const std::exception &e) {
@@ -863,10 +868,10 @@ Config::opt_parser()
         grant_directories_.emplace(
             canonical(dir_relative_to_home_ ? homepath_ / d : d));
       },
-      "Grant full access to DIR", "DIR");
+      "Grant full access to DIR.", "DIR");
   opts(
       "-D", "--nocwd", [this] { grant_cwd_ = false; },
-      "Do not grant access to current working directory");
+      "Do not grant access to the current working directory");
   opts(
       "-n", "--name",
       [this](path sb) {
@@ -889,11 +894,34 @@ Config::opt_parser()
       "Erase $HOME/FILE when first creating overlay home", "FILE");
   opts(
       "--unmask", [this](path p) { mask_files_.erase(p); },
-      "erase the effects of a previous --mask option", "FILE");
+      "Undo the effects of a previous --mask option", "FILE");
   opts(
       "--unsetenv",
-      [this](std::string var) { env_filter_.emplace(std::move(var)); },
-      "Remove VAR from environment (VAR can contain wildcard '*')", "VAR");
+      [this](std::string_view var) {
+        erase_if(setenv_,
+                 [var](const auto &it) { return glob(var, it.first); });
+        env_filter_.emplace(var);
+      },
+      "Remove VAR (wich may contain wildcard '*') from the environment", "VAR");
+  opts(
+      "--setenv",
+      [this](std::string var) {
+        if (auto pos = var.find('='); pos != var.npos)
+          setenv_.insert_or_assign(var.substr(0, pos), var);
+        else if (auto it = env_filter_.find(var); it != env_filter_.end())
+          env_filter_.erase(it);
+        else if (var.contains(' '))
+          // space almost certainly an error since it didn't match
+          err<Options::Error>(
+              R"(Environment variable "{}" contains space, did you mean '='?)",
+              var);
+        else if (const char *p = getenv(var.c_str());
+                 p && std::ranges::any_of(env_filter_, [&var](const auto &pat) {
+                   return glob(pat, var);
+                 }))
+          setenv_.insert_or_assign(var, std::format("{}={}", var, p));
+      },
+      "Undo the effects of --unsetenv=VAR, or set VAR=VALUE", "VAR[=VALUE]");
   opts(
       "--command", [this](std::string cmd) { shellcmd_ = std::move(cmd); },
       R"(Bash command line to execute program (default: "$0" "$@"))", "CMD");
@@ -905,9 +933,12 @@ std::string option_help;
 [[noreturn]] static void
 usage(int status)
 {
-  std::print(status ? stderr : stdout,
-             "usage: {0} [OPTIONS] [CMD [ARG...]]\n{1}",
-             prog.filename().string(), option_help);
+  if (status)
+    std::println(stderr, "Run {} --help for usage information",
+                 prog.filename().string());
+  else
+    std::print(stdout, "usage: {0} [OPTIONS] [CMD [ARG...]]\n{1}",
+               prog.filename().string(), option_help);
   exit(status);
 }
 
@@ -986,6 +1017,8 @@ The default is CMD.conf if it exists, otherwise default.conf)",
     conf.make_default_conf();
     conf.parse_config_file("default.conf");
   }
+  // Re-parse command line to override files
+  opts->parse_argv(argc, argv);
 
   restore.reset();
 
