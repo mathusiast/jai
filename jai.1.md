@@ -1,6 +1,7 @@
-% jai(1)
-% David Mazieres
-%
+---
+title: jai(1)
+author: David Mazieres
+---
 
 # NAME
 
@@ -336,3 +337,7 @@ these up if you are unable to delete them.
 In general overlayfs can be flaky.  If the attributes on the
 `default.changes` directory get out of sync, it may require making a
 new `default.changes` directory to get around mounting errors.
+
+# SEE ALSO
+
+<https://github.com/stanford-scs/jai> - jai home page
