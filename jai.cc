@@ -1055,7 +1055,7 @@ Config::opt_parser(bool dotjail)
         if (parsing_config_file_)
           storagedir_ = homepath_ / sd;
         else
-          storagedir_ = sd;
+          storagedir_ = cwd() / sd;
       },
       R"(Store overlay and private home directories in DIR
 (default: $JAI_CONFIG_DIR or $HOME/.jai))",
