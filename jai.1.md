@@ -1,6 +1,7 @@
 ---
 title: jai(1)
 author: David Mazieres
+outline: [1,2]
 ---
 
 # NAME
