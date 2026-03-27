@@ -23,12 +23,14 @@ If building from a release tarball, autotools are not required:
 To install (must be root for setuid):
 
     sudo make install
+    sudo systemd-sysusers
 
 To override the installation prefix:
 
     ./configure --prefix=/usr
     make
     sudo make install
+    sudo systemd-sysusers
 
 Most of the tests require a setuid root version of jai to test.  Since
 people's build directories are often mounted nosuid, make `jai.suid`

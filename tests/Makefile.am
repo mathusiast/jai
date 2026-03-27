@@ -32,7 +32,7 @@ EXTRA_DIST = $(TESTS) common.sh.in setup-setuid.sh.in
 CLEANFILES = *~
 
 maintainer-clean-local:
-	-rm -rf .deps
+	rm -rf .cache .deps
 
 MAINTAINERCLEANFILES = $(srcdir)/Makefile.in
 

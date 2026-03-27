@@ -34,7 +34,10 @@ AC_ARG_WITH([untrusted-user],
 AS_IF([test -z "$UNTRUSTED_USER"], [
   UNTRUSTED_USER=$(getent passwd 2>/dev/null | \
     awk -F: '$3 != 0 && $5 == "JAI sandbox untrusted user" { print $1; exit }')
-  AS_IF([test -z "$UNTRUSTED_USER"], [UNTRUSTED_USER=jai])
+  AS_IF([test -z "$UNTRUSTED_USER"], [
+    AS_IF([getent passwd jai > /dev/null],
+      [UNTRUSTED_USER=_jai], [UNTRUSTED_USER=jai])
+  ])
 ])
 AC_MSG_NOTICE([untrusted user: $UNTRUSTED_USER])
 AC_SUBST([UNTRUSTED_USER])

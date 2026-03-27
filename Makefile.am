@@ -26,7 +26,8 @@ CLEANFILES = *~ jai.suid
 DISTCLEANFILES = jai.conf
 
 maintainer-clean-local:
-	-rm -rf .deps
+	rm -rf .cache .deps
+	rm -f compile_commands.json jai-*.tar.gz
 
 MAINTAINERCLEANFILES = \
 	jai.1 \
@@ -45,15 +46,19 @@ install-exec-hook:
 	-chmod 04511 $(DESTDIR)$(bindir)/jai
 
 install-data-hook:
-	test ! -r "$(DESTDIR)/etc/passwd" || \
-		([[ "$(prefix)" == /usr || "$(prefix)" == /usr/local ]] && \
-		systemd-sysusers --root="$(DESTDIR)/") || :
+	@if test -z "$(DESTDIR)" && \
+		! getent passwd $(JAI_USER) >/dev/null; then \
+	    printf "\nTo to create the jai user, please run\n\n"; \
+	    if test /usr = "$(prefix)" -o /usr/local = "$(prefix)"; then \
+	      printf "    systemd-sysusers\n\n"; \
+	    else \
+	      printf "    systemd-sysusers %s\n\n" "$(sysusersdir)/jai.conf"; \
+	    fi; \
+	fi
 
 uninstall-hook:
-	@set -x; if test -r "$(DESTDIR)/etc/passwd" && \
-	[[ "$(prefix)" == /usr || "$(prefix)" == /usr/local ]] && \
-	gecos=$$(getent passwd @UNTRUSTED_USER@ 2>/dev/null | cut -d: -f5) \
-	    && test "$$gecos" = "JAI sandbox untrusted user"; then \
-	  echo "userdel $(JAI_USER)"; \
-	  userdel -R "$(DESTDIR)/" "$(JAI_USER)" || :; \
+	@if test -z "$(DESTDIR)" && \
+		getent passwd $(JAI_USER) >/dev/null; then \
+	    printf "\nTo to remove the jai user, please run\n\n    %s\n\n" \
+		"userdel $(JAI_USER)"; \
 	fi
