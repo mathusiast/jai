@@ -1,6 +1,6 @@
 AC_INIT([jai], [0.1], [https://www.scs.stanford.edu/~dm/addr/],,
         https://github.com/stanford-scs/jai)
-AM_INIT_AUTOMAKE([foreign -Wall -Werror])
+AM_INIT_AUTOMAKE([foreign -Wall -Werror serial-tests])
 AC_CONFIG_HEADERS([config.h])
 
 : ${CXXLANG=-std=gnu++23}
@@ -39,5 +39,11 @@ AC_SUBST([UNTRUSTED_USER])
 AC_DEFINE_UNQUOTED([UNTRUSTED_USER], ["$UNTRUSTED_USER"],
   [Username for the sandboxed untrusted user])
 
-AC_CONFIG_FILES([Makefile jai.conf])
+TEST_ABS_TOP_BUILDDIR=`pwd -P`
+TEST_ABS_TOP_SRCDIR=`cd "$srcdir" && pwd -P`
+AC_SUBST([TEST_ABS_TOP_BUILDDIR])
+AC_SUBST([TEST_ABS_TOP_SRCDIR])
+
+AC_CONFIG_FILES([Makefile tests/Makefile jai.conf tests/common.sh tests/setup-setuid.sh])
+AC_CONFIG_COMMANDS([test-scripts], [chmod +x tests/common.sh tests/setup-setuid.sh])
 AC_OUTPUT

@@ -1,0 +1,376 @@
+#!/bin/sh
+
+set -eu
+
+ABS_TOP_BUILDDIR='@TEST_ABS_TOP_BUILDDIR@'
+ABS_TOP_SRCDIR='@TEST_ABS_TOP_SRCDIR@'
+JAI_BUILD_BIN=$ABS_TOP_BUILDDIR/jai
+JAI_SUID_BIN=$ABS_TOP_BUILDDIR/jai.suid
+JAI_BIN=$JAI_BUILD_BIN
+JAI_TEST_PROBE=$ABS_TOP_BUILDDIR/tests/jai_test_probe
+JAI_TEST_PTY_DRIVER=$ABS_TOP_BUILDDIR/tests/jai_test_pty_driver
+UNTRUSTED_GECOS='JAI sandbox untrusted user'
+UNTRUSTED_USER='@UNTRUSTED_USER@'
+CURRENT_UID=$(id -u)
+CURRENT_USER=$(id -un)
+REAL_USER=
+REAL_UID=
+REAL_HOME=
+TEST_PRIVILEGE_MODE=
+
+TEST_ROOT=
+CONFIG_DIR=
+WORKDIR=
+CLEANUP_PATHS=
+CAPTURE_STATUS=
+CAPTURE_STDOUT=
+CAPTURE_STDERR=
+CAPTURE_OUT_FILE=
+CAPTURE_ERR_FILE=
+
+skip() {
+  printf 'SKIP: %s\n' "$*" >&2
+  exit 77
+}
+
+fail() {
+  printf 'FAIL: %s\n' "$*" >&2
+  exit 1
+}
+
+ensure_current_build_jai() {
+  [ -x "$JAI_BUILD_BIN" ] ||
+    fail "$JAI_BUILD_BIN has not been built; run make first"
+
+  status=0
+  make -C "$ABS_TOP_BUILDDIR" -q jai >/dev/null 2>&1 || status=$?
+  if [ "$status" -eq 0 ]; then
+    return
+  fi
+  [ "$status" -eq 1 ] || fail "make -C $ABS_TOP_BUILDDIR -q jai failed"
+  make -C "$ABS_TOP_BUILDDIR" jai >/dev/null
+}
+
+resolve_real_identity() {
+  [ -n "$REAL_USER" ] && return
+
+  if [ -n "${JAI_TEST_USER:-}" ]; then
+    REAL_USER=$JAI_TEST_USER
+  elif [ "$CURRENT_UID" -eq 0 ]; then
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+      REAL_USER=$SUDO_USER
+    else
+      owner_uid=$(stat -c %u "$ABS_TOP_BUILDDIR") ||
+        fail "cannot stat $ABS_TOP_BUILDDIR"
+      if [ "$owner_uid" -eq 0 ]; then
+        owner_uid=$(stat -c %u "$ABS_TOP_SRCDIR") ||
+          fail "cannot stat $ABS_TOP_SRCDIR"
+      fi
+      [ "$owner_uid" -ne 0 ] ||
+        fail "running tests as root requires JAI_TEST_USER or a non-root build/src directory owner"
+      owner_entry=$(getent passwd "$owner_uid") ||
+        fail "cannot find password entry for uid $owner_uid"
+      REAL_USER=$(printf '%s\n' "$owner_entry" | cut -d: -f1)
+    fi
+  else
+    REAL_USER=$CURRENT_USER
+  fi
+
+  entry=$(getent passwd "$REAL_USER") ||
+    fail "cannot find password entry for $REAL_USER"
+  REAL_UID=$(printf '%s\n' "$entry" | cut -d: -f3)
+  REAL_HOME=$(printf '%s\n' "$entry" | cut -d: -f6)
+}
+
+find_setuid_jai() {
+  if [ -u "$JAI_SUID_BIN" ] && [ -r "$JAI_SUID_BIN" ] && [ -x "$JAI_SUID_BIN" ] &&
+     cmp -s "$JAI_BUILD_BIN" "$JAI_SUID_BIN" 2>/dev/null; then
+    printf '%s\n' "$JAI_SUID_BIN"
+    return 0
+  fi
+  return 1
+}
+
+configure_privilege_mode() {
+  [ -n "$TEST_PRIVILEGE_MODE" ] && return
+
+  resolve_real_identity
+  requested_mode=${JAI_TEST_PRIVILEGE_MODE:-auto}
+
+  case $requested_mode in
+    auto)
+      if [ "$CURRENT_UID" -eq 0 ]; then
+        TEST_PRIVILEGE_MODE=root
+        JAI_BIN=$JAI_BUILD_BIN
+      elif setuid_jai=$(find_setuid_jai); then
+        TEST_PRIVILEGE_MODE=setuid
+        JAI_BIN=$setuid_jai
+      else
+        skip "need a root shell or a current $JAI_SUID_BIN; run tests/setup-setuid.sh or relink jai.suid manually"
+      fi
+      ;;
+    root)
+      [ "$CURRENT_UID" -eq 0 ] ||
+        skip "JAI_TEST_PRIVILEGE_MODE=root requires uid 0"
+      TEST_PRIVILEGE_MODE=root
+      JAI_BIN=$JAI_BUILD_BIN
+      ;;
+    setuid)
+      if setuid_jai=$(find_setuid_jai); then
+        TEST_PRIVILEGE_MODE=setuid
+        JAI_BIN=$setuid_jai
+      else
+        skip "current setuid jai not found at $JAI_SUID_BIN"
+      fi
+      ;;
+    *)
+      fail "unknown JAI_TEST_PRIVILEGE_MODE: $requested_mode"
+      ;;
+  esac
+}
+
+register_cleanup_path() {
+  CLEANUP_PATHS="${CLEANUP_PATHS}${CLEANUP_PATHS:+ }$1"
+}
+
+cleanup_jai() {
+  if [ -x "$JAI_BIN" ]; then
+    cfgdir=${CONFIG_DIR:-$REAL_HOME/.jai}
+    case $TEST_PRIVILEGE_MODE in
+      root)
+        env SUDO_USER="$REAL_USER" USER="$REAL_USER" LOGNAME="$REAL_USER" \
+          HOME="$REAL_HOME" JAI_CONFIG_DIR="$cfgdir" \
+          "$JAI_BIN" -u >/dev/null 2>&1 || true
+        ;;
+      setuid)
+        env -u SUDO_USER USER="$REAL_USER" LOGNAME="$REAL_USER" \
+          HOME="$REAL_HOME" JAI_CONFIG_DIR="$cfgdir" \
+          "$JAI_BIN" -u >/dev/null 2>&1 || true
+        ;;
+    esac
+  fi
+}
+
+cleanup_test() {
+  cleanup_jai || true
+  for path in $CLEANUP_PATHS; do
+    rm -rf -- "$path" >/dev/null 2>&1 || true
+  done
+  if [ -n "$TEST_ROOT" ] && [ -d "$TEST_ROOT" ]; then
+    rm -rf -- "$TEST_ROOT" >/dev/null 2>&1 || true
+  fi
+}
+
+setup_test() {
+  label=$1
+  configure_privilege_mode
+  ensure_current_build_jai
+  [ -x "$JAI_BIN" ] || fail "$JAI_BIN has not been built"
+  TEST_ROOT=$(mktemp -d "$ABS_TOP_BUILDDIR/test-tmp.$label.XXXXXX")
+  CONFIG_DIR=$(mktemp -d "/dev/shm/jai-config.$label.XXXXXX")
+  WORKDIR=$TEST_ROOT/work
+  CLEANUP_PATHS=$CONFIG_DIR
+  mkdir -p "$WORKDIR"
+  chmod 755 "$CONFIG_DIR"
+  if [ "$TEST_PRIVILEGE_MODE" = "root" ]; then
+    chown "$REAL_USER" "$TEST_ROOT" "$CONFIG_DIR" "$WORKDIR"
+  fi
+  CAPTURE_OUT_FILE=$TEST_ROOT/capture.out
+  CAPTURE_ERR_FILE=$TEST_ROOT/capture.err
+  trap cleanup_test EXIT HUP INT TERM
+  cleanup_jai
+}
+
+require_built_helper() {
+  [ -x "$1" ] || fail "$1 has not been built"
+}
+
+require_setsid() {
+  command -v setsid >/dev/null 2>&1 || skip "setsid not found"
+}
+
+run_root() {
+  case $TEST_PRIVILEGE_MODE in
+    root)
+      "$@"
+      ;;
+    *)
+      fail "run_root is unavailable in $TEST_PRIVILEGE_MODE mode"
+      ;;
+  esac
+}
+
+run_jai_launcher() {
+  case $TEST_PRIVILEGE_MODE in
+    setuid)
+      "$@"
+      ;;
+    root)
+      run_root "$@"
+      ;;
+  esac
+}
+
+run_jai_no_tty() {
+  require_setsid
+  case $TEST_PRIVILEGE_MODE in
+    root)
+      setsid env SUDO_USER="$REAL_USER" USER="$REAL_USER" LOGNAME="$REAL_USER" \
+        HOME="$REAL_HOME" JAI_CONFIG_DIR="$CONFIG_DIR" "$JAI_BIN" "$@"
+      ;;
+    setuid)
+      setsid env -u SUDO_USER USER="$REAL_USER" LOGNAME="$REAL_USER" \
+        HOME="$REAL_HOME" JAI_CONFIG_DIR="$CONFIG_DIR" "$JAI_BIN" "$@"
+      ;;
+  esac
+}
+
+run_jai() {
+  case $TEST_PRIVILEGE_MODE in
+    root)
+      env SUDO_USER="$REAL_USER" USER="$REAL_USER" LOGNAME="$REAL_USER" \
+        HOME="$REAL_HOME" JAI_CONFIG_DIR="$CONFIG_DIR" "$JAI_BIN" "$@"
+      ;;
+    setuid)
+      env -u SUDO_USER USER="$REAL_USER" LOGNAME="$REAL_USER" \
+        HOME="$REAL_HOME" JAI_CONFIG_DIR="$CONFIG_DIR" "$JAI_BIN" "$@"
+      ;;
+  esac
+}
+
+run_jai_with_env() {
+  envpair=$1
+  shift
+  case $TEST_PRIVILEGE_MODE in
+    root)
+      env SUDO_USER="$REAL_USER" USER="$REAL_USER" LOGNAME="$REAL_USER" \
+        HOME="$REAL_HOME" JAI_CONFIG_DIR="$CONFIG_DIR" "$envpair" \
+        "$JAI_BIN" "$@"
+      ;;
+    setuid)
+      env -u SUDO_USER USER="$REAL_USER" LOGNAME="$REAL_USER" \
+        HOME="$REAL_HOME" JAI_CONFIG_DIR="$CONFIG_DIR" "$envpair" \
+        "$JAI_BIN" "$@"
+      ;;
+  esac
+}
+
+init_config() {
+  run_jai --init >/dev/null 2>&1
+  chmod 755 "$CONFIG_DIR"
+}
+
+capture() {
+  if "$@" >"$CAPTURE_OUT_FILE" 2>"$CAPTURE_ERR_FILE"; then
+    CAPTURE_STATUS=0
+  else
+    CAPTURE_STATUS=$?
+  fi
+  CAPTURE_STDOUT=$(cat "$CAPTURE_OUT_FILE")
+  CAPTURE_STDERR=$(cat "$CAPTURE_ERR_FILE")
+}
+
+capture_in_dir() {
+  dir=$1
+  shift
+  if (cd "$dir" && "$@") >"$CAPTURE_OUT_FILE" 2>"$CAPTURE_ERR_FILE"; then
+    CAPTURE_STATUS=0
+  else
+    CAPTURE_STATUS=$?
+  fi
+  CAPTURE_STDOUT=$(cat "$CAPTURE_OUT_FILE")
+  CAPTURE_STDERR=$(cat "$CAPTURE_ERR_FILE")
+}
+
+assert_status() {
+  [ "$CAPTURE_STATUS" -eq "$1" ] ||
+    fail "expected status $1, got $CAPTURE_STATUS"
+}
+
+assert_eq() {
+  [ "$1" = "$2" ] || fail "expected [$2], got [$1]"
+}
+
+assert_contains() {
+  printf '%s\n' "$1" | grep -F -- "$2" >/dev/null ||
+    fail "expected output to contain [$2]"
+}
+
+assert_not_contains() {
+  if printf '%s\n' "$1" | grep -F -- "$2" >/dev/null; then
+    fail "expected output not to contain [$2]"
+  fi
+}
+
+assert_path_exists() {
+  [ -e "$1" ] || fail "expected path to exist: $1"
+}
+
+assert_path_missing() {
+  [ ! -e "$1" ] || fail "expected path to be absent: $1"
+}
+
+assert_file_equals() {
+  actual=$(cat "$1")
+  [ "$actual" = "$2" ] || fail "expected $1 to contain [$2], got [$actual]"
+}
+
+assert_root_file_equals() {
+  capture cat "$1"
+  assert_status 0
+  assert_eq "$CAPTURE_STDOUT" "$2"
+}
+
+assert_output_line() {
+  grep -Fx -- "$1" "$CAPTURE_OUT_FILE" >/dev/null ||
+    fail "expected output line [$1]"
+}
+
+assert_no_output_line() {
+  if grep -Fx -- "$1" "$CAPTURE_OUT_FILE" >/dev/null; then
+    fail "did not expect output line [$1]"
+  fi
+}
+
+assert_root_path_exists() {
+  test -e "$1" || fail "expected root-visible path to exist: $1"
+}
+
+assert_root_path_missing() {
+  if test -e "$1"; then
+    fail "expected root-visible path to be absent: $1"
+  fi
+}
+
+get_mount_line() {
+  awk -v mp="$1" '
+    $5 == mp { print; found = 1 }
+    END { exit found ? 0 : 1 }
+  ' /proc/self/mountinfo
+}
+
+assert_mount_exists() {
+  get_mount_line "$1" >/dev/null 2>&1 ||
+    fail "expected mount to exist at $1"
+}
+
+assert_no_mount() {
+  if get_mount_line "$1" >/dev/null 2>&1; then
+    fail "expected no mount at $1"
+  fi
+}
+
+ensure_untrusted_user() {
+  if ! getent passwd "$UNTRUSTED_USER" >/dev/null 2>&1; then
+      skip "$UNTRUSTED_USER is missing; run systemd-sysusers ./jai.conf"
+  fi
+  entry=$(getent passwd "$UNTRUSTED_USER")
+  uid=$(printf '%s\n' "$entry" | cut -d: -f3)
+  home=$(printf '%s\n' "$entry" | cut -d: -f6)
+  gecos=$(printf '%s\n' "$entry" | cut -d: -f5)
+  [ "$uid" -ne 0 ] || fail "$UNTRUSTED_USER must not have uid 0"
+  [ "$home" = "/" ] || fail "$UNTRUSTED_USER must have home /"
+  [ "$gecos" = "$UNTRUSTED_GECOS" ] ||
+    fail "$UNTRUSTED_USER must have GECOS $UNTRUSTED_GECOS"
+  UNTRUSTED_UID=$uid
+}

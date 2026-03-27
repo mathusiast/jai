@@ -1,0 +1,5 @@
+/common.sh
+/jai_test_probe
+/jai_test_pty_driver
+/options_test
+/setup-setuid.sh

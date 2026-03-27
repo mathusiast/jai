@@ -1,11 +1,9 @@
-# generated
 *.o
 *~
 .*~
 .cache
-/.deps
-/Makefile
-/Makefile.in
+.deps
+.dirstamp
 /aclocal.m4
 /autom4te.cache/
 /config.h
@@ -19,6 +17,9 @@
 /jai-*.tar.gz
 /jai.1
 /jai.conf
+/jai.suid
 /missing
 /stamp-h1
+Makefile
+Makefile.in
 compile_commands.json

@@ -1,3 +1,5 @@
+SUBDIRS = tests
+
 bin_PROGRAMS = jai
 
 AM_CXXFLAGS = $(MOUNT_CFLAGS) $(LIBACL_CFLAGS)
@@ -20,10 +22,10 @@ bashcomp_DATA = bash-completion/jai
 
 EXTRA_DIST = jai.1 jai.1.md jai.conf.in bash-completion/jai logo.svg
 
-CLEANFILES = *~
+CLEANFILES = *~ jai.suid
 DISTCLEANFILES = jai.conf
 
-distclean-local:
+maintainer-clean-local:
 	-rm -rf .deps
 
 MAINTAINERCLEANFILES = \

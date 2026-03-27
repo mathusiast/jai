@@ -29,3 +29,13 @@ To override the installation prefix:
     ./configure --prefix=/usr
     make
     sudo make install
+
+Most of the tests require a setuid root version of jai to test.  Since
+people's build directories are often mounted nosuid, make `jai.suid`
+in the top of your build directory a symbolic link to a place with a
+setuid executable.  You can run:
+
+    sudo test/setup-setuid.sh
+
+to do this automatically in on /var/tmp, which is generally mounted
+setuid capable.
