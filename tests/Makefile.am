@@ -25,7 +25,7 @@ check_PROGRAMS = jai_test_probe jai_test_pty_driver options_test
 
 jai_test_probe_SOURCES = jai-test-probe.cc
 jai_test_pty_driver_SOURCES = jai-test-pty-driver.cc
-options_test_SOURCES = options_test.cc ../options.cc ../options.h
+options_test_SOURCES = options_test.cc ../src/options.cc ../src/options.h
 
 EXTRA_DIST = $(TESTS) common.sh.in setup-setuid.sh.in
 

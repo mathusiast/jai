@@ -2,11 +2,12 @@ SUBDIRS = tests
 
 bin_PROGRAMS = jai
 
+AM_CPPFLAGS = -I$(top_builddir) -I$(top_srcdir)/src
 AM_CXXFLAGS = $(MOUNT_CFLAGS) $(LIBACL_CFLAGS)
 
-jai_SOURCES = complete.cc cred.cc default_conf.cc fs.cc jai.cc	\
-options.cc argtype.h config.h cred.h defer.h err.h fs.h jai.h	\
-options.h
+jai_SOURCES = src/complete.cc src/cred.cc src/default_conf.cc	\
+src/fs.cc src/jai.cc src/options.cc src/argtype.h src/cred.h	\
+src/defer.h src/err.h src/fs.h src/jai.h src/options.h
 jai_LDADD = $(MOUNT_LIBS) $(LIBACL_LIBS)
 
 man1_MANS = jai.1
