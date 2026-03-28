@@ -1,4 +1,5 @@
 #include "jai.h"
+#include "netns.h"
 #include "seccomp.h"
 
 #include <cassert>
@@ -792,7 +793,11 @@ Config::exec(int nsfd, char **argv)
   // original jai process stop it (from outside the PID namespace).
   auto stop_me = xpipe();
 
-  if (auto pid = xfork(CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWNS)) {
+  uint64_t clone_flags = CLONE_NEWPID | CLONE_NEWIPC | CLONE_NEWNS;
+  if (!net_)
+    clone_flags |= CLONE_NEWNET;
+
+  if (auto pid = xfork(clone_flags)) {
     // This is the last process in the old PID namespace
     close(nsfd);
     stop_me[1].reset();
@@ -949,6 +954,11 @@ try {
 void
 Config::pid2(char **argv)
 try {
+  // Bring up loopback before dropping privileges — we need
+  // CAP_NET_ADMIN which we have inside the new network namespace
+  if (!net_)
+    setup_loopback();
+
   if (mode_ == kCasual || mode_ == kBare)
     user_cred_.make_real();
   else
@@ -1111,6 +1121,12 @@ Config::opt_parser(bool dotjail)
   opts(
       "--no-seccomp", [this] { seccomp_ = false; },
       "Disable seccomp syscall filtering");
+  opts(
+      "--no-net", [this] { net_ = false; },
+      "Isolate network (loopback only, no external access)");
+  opts(
+      "--net", [this] { net_ = true; },
+      "Allow host network access (default)");
   return ret;
 }
 

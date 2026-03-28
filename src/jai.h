@@ -82,6 +82,7 @@ struct Config {
   PathSet mask_files_;
   bool mask_warn_{};
   bool seccomp_{true};
+  bool net_{true};        // true = host networking, false = isolated
   bool parsing_config_file_{};
 
   std::string user_;
