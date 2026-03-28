@@ -479,6 +479,9 @@ Config::make_mnt_ns()
   if (unshare(CLONE_NEWNS))
     syserr("unshare(CLONE_NEWNS)");
   Fd newns = xopenat(-1, "/proc/self/ns/mnt", O_RDONLY | O_CLOEXEC);
+  // _restore_ns (above) ensures we return to the old mount namespace
+  // on any failure, preventing mount leaks from partial setup.
+
   xmnt_setattr(-1, "/",
                mount_attr{
                    .attr_set = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID,
